@@ -1,19 +1,26 @@
 from pathlib import Path
 
+from terminal.command_registry import get_header_commands
+
 
 def print_header(memory_mode="OFF"):
     print()
     print("=" * 56)
     print("                    AI GATEWAY")
     print("=" * 56)
-    print(f"  Memory: {memory_mode}")
+    mode = memory_mode
+    if isinstance(memory_mode, dict):
+        mode = f"{memory_mode.get('mode', 'OFF')} | Snapshot: {memory_mode.get('snapshot', 'NOT LOADED')}"
+    print(f"  Memory: {mode}")
     print()
-    print("  /memory          View project memory")
-    print("  /memory use      Use memory once")
-    print("  /memory on/off   Enable or disable memory")
-    print("  /memory refresh  Refresh the memory snapshot")
-    print("  /save            Save durable project knowledge")
-    print("  /exit            Quit")
+    print("  Quick help:")
+    for command in get_header_commands():
+        print(f"  {command.usage}")
+        print(f"    {command.description}")
+        if command.examples:
+            print("    Example(s):")
+            for example in command.examples:
+                print(f"      {example}")
     print("=" * 56)
 
 
@@ -91,16 +98,10 @@ def print_memory(memory):
 
     for name, content in memory.items():
         title = name.replace("_", " ").upper()
-
         print()
         print(f"[ {title} ]")
         print("-" * 56)
-
-        if content.strip():
-            print(content.strip())
-        else:
-            print("[EMPTY]")
-
+        print(content.strip() if content.strip() else "[EMPTY]")
     print()
 
 
@@ -118,15 +119,12 @@ def print_workspace(directories):
     if not directories:
         print()
         print("  No workspace directories configured.")
-        print()
-        print("  Add one with:")
+        print("\n  Add one with:")
         print("  /workspace add <directory>")
-        print()
-        print("=" * 56)
+        print("\n" + "=" * 56)
         return
 
     print()
-
     for entry in directories:
         path = Path(entry["path"])
         print(f"  [{entry['id']}] {path.name}")
@@ -145,15 +143,10 @@ def ask_edit_approval(file_name, reason, diff):
     print("=" * 60)
     print(f"PROPOSED EDIT: {file_name}")
     print("=" * 60)
-
-    print()
-    print("Reason:")
+    print("\nReason:")
     print(reason)
-
-    print()
-    print("Changes:")
+    print("\nChanges:")
     print(diff)
-
     print()
     answer = input("Apply this change? [y/N]: ").strip().lower()
     return answer in {"y", "yes"}

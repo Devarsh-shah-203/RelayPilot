@@ -10,6 +10,7 @@ from memory.prompts import build_save_prompt
 from files.edit_prompt import build_edit_prompt
 from memory.saver import MemorySaver
 from workspace.manager import WorkspaceManager
+from terminal.command_registry import render_command_help
 from terminal.ui import (
     print_auth_required,
     print_header,
@@ -164,6 +165,15 @@ def main():
             if not prompt:
                 continue
             command = prompt.lower()
+
+            # --------------------------------------------------
+            # COMMAND HELP (local operation; never sent to the model)
+            # --------------------------------------------------
+
+            if command == "/commands" or command.startswith("/commands "):
+                category = prompt[len("/commands"):].strip()
+                render_command_help(category or None)
+                continue
 
             # --------------------------------------------------
             # EXIT
