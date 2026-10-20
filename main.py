@@ -5,6 +5,11 @@ from browser.chat import BrowserChat
 from context.builder import ContextBuilder
 from context.session import MemoryContextSession
 from files.context import FileContextBuilder
+from attachments.integration import (
+    build_attachment_prompt,
+    plan_referenced_files,
+    upload_and_confirm,
+)
 from memory.manager import MemoryManager
 from memory.prompts import build_save_prompt
 from files.edit_prompt import build_edit_prompt
@@ -519,7 +524,51 @@ def main():
             # --------------------------------------------------
 
             try:
-                file_context = file_context_builder.build(prompt)
+                # Plan file delivery before reading file contents. PDF/image/spreadsheet
+                # references must use browser attachments rather than UTF-8 inline reads.
+                # Small text requests retain the existing inline-context behavior unless
+                # AI_GATEWAY_FORCE_ATTACHMENTS=1 is set for an upload test.
+                memory_characters = 0
+                if include_memory:
+                    try:
+                        memory_values = context_builder.memory.read_all()
+                        memory_characters = sum(
+                            len(value) for value in memory_values.values()
+                            if isinstance(value, str) and value.strip()
+                        )
+                    except Exception:
+                        # ContextBuilder remains responsible for surfacing real memory
+                        # read errors; this size estimate only influences delivery mode.
+                        memory_characters = 0
+
+                attachment_plan = plan_referenced_files(
+                    prompt,
+                    workspace,
+                    memory_characters=memory_characters,
+                    edit_mode=edit_mode,
+                )
+                model_prompt = prompt
+                if attachment_plan.uses_attachments:
+                    upload_decision = upload_and_confirm(
+                        attachment_plan.paths,
+                        chat.page,
+                    )
+                    # Critical safety gate: never submit a request with unverified or
+                    # unresolved files unless the user explicitly chose manual or
+                    # verified-only recovery inside upload_and_confirm().
+                    if not upload_decision.proceed:
+                        print("\nRequest was not submitted because file attachments were not confirmed.")
+                        continue
+                    model_prompt = build_attachment_prompt(
+                        prompt,
+                        attachment_plan.references,
+                        upload_decision.attached_paths,
+                        upload_decision.report,
+                    )
+                    file_context = []
+                else:
+                    file_context = file_context_builder.build(prompt)
+
                 if edit_mode:
                     final_prompt = build_edit_prompt(
                         prompt,
@@ -528,12 +577,12 @@ def main():
                     )
                 else:
                     final_prompt = context_builder.build(
-                        prompt,
+                        model_prompt,
                         include_memory=include_memory,
                         file_context=file_context
                     )
             except Exception as error:
-                print("\nCould not build context.")
+                print("\nCould not prepare prompt context or attachments.")
                 print(error)
                 continue
 
