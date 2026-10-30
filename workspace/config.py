@@ -7,10 +7,11 @@ class WorkspaceConfig:
     Handles persistent workspace configuration.
 
     Workspace configuration is stored locally and contains
-    the directories that AI Gateway is allowed to access.
+    the directories that RelayPilot is allowed to access.
     """
 
-    CONFIG_DIR_NAME = ".ai-gateway"
+    CONFIG_DIR_NAME = ".relaypilot"
+   
     CONFIG_FILE_NAME = "workspace.json"
 
     def __init__(self, gateway_dir):
@@ -23,6 +24,7 @@ class WorkspaceConfig:
         self.config_file = (
             self.config_dir / self.CONFIG_FILE_NAME
         )
+       
 
     def ensure_config(self):
         """
@@ -35,8 +37,6 @@ class WorkspaceConfig:
             exist_ok=True
         )
 
-        if not self.config_file.exists():
-            self.save([])
 
     def load(self):
         """

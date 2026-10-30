@@ -7,7 +7,7 @@ class WorkspaceManager:
     """
     Manages user-configured workspace directories.
 
-    The AI Gateway itself is NOT considered a workspace.
+    The RelayPilot itself is NOT considered a workspace.
 
     All future file reads and modifications should go
     through this manager for path validation.
@@ -79,7 +79,7 @@ class WorkspaceManager:
             )
 
         # ------------------------------------------------
-        # Protect AI Gateway itself
+        # Protect RelayPilot itself
         # ------------------------------------------------
 
         try:
@@ -88,7 +88,7 @@ class WorkspaceManager:
             )
 
             raise ValueError(
-                "AI Gateway directory cannot be "
+                "RelayPilot directory cannot be "
                 "configured as a workspace."
             )
 
@@ -97,7 +97,7 @@ class WorkspaceManager:
             # This ValueError means the path is NOT
             # inside the gateway directory.
             if str(error).startswith(
-                "AI Gateway directory"
+                "RelayPilot directory"
             ):
                 raise
 
