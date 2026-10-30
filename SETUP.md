@@ -1,19 +1,19 @@
-# AI Gateway — Setup Guide
+# RelayPilot — Setup Guide
 
-This guide takes you from a fresh Windows machine to running AI Gateway in your terminal.
+This guide takes you from a fresh Windows machine to running RelayPilot in your terminal.
 
-AI Gateway is being designed to work with different browser-based AI providers. **For now, only ChatGPT is supported and tested**; Claude, Gemini, and other providers are not currently supported.
+RelayPilot is being designed to work with different browser-based AI providers. **For now, only ChatGPT is supported and tested**; Claude, Gemini, and other providers are not currently supported.
 
 The normal workflow is:
 
 1. Install Python.
-2. Get the AI Gateway project.
+2. Get the RelayPilot project.
 3. Create and activate a `.venv` virtual environment.
 4. Install the packages listed in `requirements.txt`.
 5. Find the location of `chrome.exe` using `chrome://version`.
 6. Start Chrome with remote debugging enabled.
 7. Sign in to ChatGPT in that Chrome window.
-8. Run `main.py` from a second terminal.
+8. Run `main.py` from a second terminal to open the full-screen Textual interface.
 
 ## 1. Install Python
 
@@ -32,13 +32,13 @@ py --version
 
 At least one of these commands should display the installed Python version. If neither command works, finish the Python installation and reopen Command Prompt before continuing.
 
-## 2. Get the AI Gateway project
+## 2. Get the RelayPilot project
 
 If Git is installed, clone the repository:
 
 ```bat
-git clone https://github.com/Devarsh-shah-203/AI-gateway.git
-cd AI-gateway
+git clone https://github.com/Devarsh-shah-203/AI-gateway.git RelayPilot
+cd RelayPilot
 ```
 
 If you downloaded the repository as a ZIP instead, extract it and open Command Prompt in the extracted folder.
@@ -55,7 +55,7 @@ You should see `main.py` and `requirements.txt` in the listing.
 
 ## 3. Create a virtual environment
 
-A virtual environment keeps AI Gateway's Python packages separate from other Python projects on your machine.
+A virtual environment keeps RelayPilot's Python packages separate from other Python projects on your machine.
 
 From the repository root, run:
 
@@ -96,7 +96,7 @@ python --version
 python -m pip --version
 ```
 
-Keep the virtual environment activated in the terminal where you install dependencies and run AI Gateway.
+Keep the virtual environment activated in the terminal where you install dependencies and run RelayPilot.
 
 ## 5. Install the dependencies from `requirements.txt`
 
@@ -125,7 +125,7 @@ If the code changes in the future to launch a Playwright-managed browser, follow
 
 ## 6. Find `chrome.exe` and start Chrome with remote debugging
 
-AI Gateway connects to Chrome at:
+RelayPilot connects to Chrome at:
 
 ```text
 http://127.0.0.1:9222
@@ -139,7 +139,7 @@ Chrome may be installed in a different location on each computer. Instead of ass
 4. Copy the full path to `chrome.exe`.
 5. Close the Chrome window before launching the dedicated profile below, especially if you plan to use the same profile directory.
 
-Open **Command Prompt** in the AI Gateway repository root and run the following command, replacing the example executable path with the path you copied:
+Open **Command Prompt** in the RelayPilot repository root and run the following command, replacing the example executable path with the path you copied:
 
 ```bat
 "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%CD%\chrome-data"
@@ -150,14 +150,14 @@ For example, if `chrome://version` shows a different executable location, use th
 This command uses a dedicated `chrome-data` profile inside the repository. The project `.gitignore` excludes this directory; still, never commit or share browser-profile data because it may contain authenticated sessions.
 
 **Important:**
-- Keep this Chrome window open while AI Gateway is running.
+- Keep this Chrome window open while RelayPilot is running.
 - Do not start a second Chrome instance using the same `chrome-data` profile while the first instance is using it.
 - If you already started Chrome using this remote-debugging profile, use that window rather than starting another copy with the same profile.
 - Do not assume that an ordinary Chrome window is the remote-debugging instance. Use the command above to start the dedicated instance.
 
 ### Sign in to the currently supported provider: ChatGPT
 
-AI Gateway is intended to become provider-agnostic, so it can eventually work with different browser-based AI models. **The current implementation supports ChatGPT only**; do not assume Claude, Gemini, or another provider will work yet.
+RelayPilot is intended to become provider-agnostic, so it can eventually work with different browser-based AI models. **The current implementation supports ChatGPT only**; do not assume Claude, Gemini, or another provider will work yet.
 
 In the Chrome window started by the command:
 
@@ -165,7 +165,7 @@ In the Chrome window started by the command:
 2. Sign in to your account if needed.
 3. Open a conversation and wait until the chat composer is available.
 
-You need your own access to the browser-based service. AI Gateway does not supply an account, subscription, or API key.
+You need your own access to the browser-based service. RelayPilot does not supply an account, subscription, or API key.
 
 ### Check the remote-debugging connection
 
@@ -173,16 +173,16 @@ With the remote-debugging Chrome window open, visit this local address in a brow
 
 http://127.0.0.1:9222/json/version
 
-If the endpoint responds with JSON describing the browser, Chrome's debugging endpoint is reachable. If it does not load, check the Chrome command and port before starting AI Gateway.
+If the endpoint responds with JSON describing the browser, Chrome's debugging endpoint is reachable. If it does not load, check the Chrome command and port before starting RelayPilot.
 
-## 7. Run AI Gateway
+## 7. Run RelayPilot
 
-Leave the remote-debugging Chrome window open. Open a **second Command Prompt** window and change to the AI Gateway repository directory.
+Leave the remote-debugging Chrome window open. Open a **second Command Prompt** window and change to the RelayPilot repository directory.
 
 For example, if you cloned the repository into your user folder:
 
 ```bat
-cd "%USERPROFILE%\AI-gateway"
+cd "%USERPROFILE%\RelayPilot"
 ```
 
 Use the actual path where you saved the project. Then activate the existing environment and start the application:
@@ -202,11 +202,11 @@ Once the CLI is running, enter a normal request, for example:
 Explain what this project does and how its main modules work.
 ```
 
-The gateway sends the request to ChatGPT in the browser and displays the completed response in the terminal.
+RelayPilot submits the request through the existing Playwright browser workflow. As the user-visible answer appears in ChatGPT, RelayPilot appends newly observed text to the active response in the terminal. The response is rendered as Markdown when generation finishes. This uses browser DOM snapshots and is not true token-level streaming.
 
 ## 8. Configure a project workspace
 
-To provide file context from one of your own projects, register its directory. Use a directory that already exists and is outside the AI Gateway repository.
+To provide file context from one of your own projects, register its directory. Use a directory that already exists and is outside the RelayPilot repository.
 
 Example:
 
@@ -268,7 +268,7 @@ Project memory is local by default and is not automatically attached to every pr
 
 **Note:** `/commands` is planned but is not implemented in the current CLI yet.
 
-## 10. What to do next time you use AI Gateway
+## 10. What to do next time you use RelayPilot
 
 After the initial setup, you do **not** need to recreate `.venv` or reinstall packages every time.
 
@@ -276,7 +276,7 @@ For each new working session:
 
 1. Start Chrome with the same remote-debugging command and `chrome-data` profile.
 2. Open ChatGPT in that Chrome window and confirm you are signed in.
-3. Open Command Prompt in the AI Gateway repository.
+3. Open Command Prompt in the RelayPilot repository.
 4. Activate `.venv`.
 5. Run `python main.py`.
 
@@ -287,13 +287,15 @@ The recurring terminal commands are:
 python main.py
 ```
 
+The old print-based CLI remains available temporarily through `python main_legacy.py` as a rollback path.
+
 If `requirements.txt` changes after you update or pull the repository, activate `.venv` and rerun:
 
 ```bat
 python -m pip install -r requirements.txt
 ```
 
-When finished, enter `/exit` in AI Gateway. You can close the dedicated Chrome window after the gateway has exited.
+When finished, enter `/exit` in RelayPilot. You can close the dedicated Chrome window after the gateway has exited.
 
 ## Troubleshooting
 
@@ -309,7 +311,7 @@ Confirm you are in the repository root and that `.venv` is activated. Then run:
 python -m pip install -r requirements.txt
 ```
 
-### AI Gateway cannot connect to Chrome
+### RelayPilot cannot connect to Chrome
 
 - Confirm Chrome was launched with `--remote-debugging-port=9222`.
 - Open `http://127.0.0.1:9222/json/version` and check that it returns browser information.
@@ -319,7 +321,8 @@ python -m pip install -r requirements.txt
 
 ### The chat interface is not ready
 
-- Open ChatGPT in the dedicated Chrome window. Other providers are not currently supported.
+- Open the provider tab you intend to use in the dedicated Chrome window, then press `Ctrl+R` in RelayPilot.
+- RelayPilot detects the provider name from the selected browser tab. Detection is informational: this integrated chat workflow is currently validated with ChatGPT only. Claude, Gemini, and other hosts are shown but prompt submission is deliberately disabled until their provider-specific browser workflows are tested.
 - Sign in if requested.
 - Wait until the conversation and input box finish loading.
 - Check whether the page displays a usage limit, sign-in prompt, or action that requires your attention.
@@ -336,7 +339,7 @@ Inspect the browser to see whether the prompt was submitted and whether the mode
 
 ## Security notes
 
-- Use a dedicated Chrome profile for AI Gateway and keep it private.
+- Use a dedicated Chrome profile for RelayPilot and keep it private.
 - Never commit browser session data, cookies, credentials, or access tokens.
 - Referencing a local file can send that file's content to the browser-based AI service as prompt context. Only reference files you are permitted to share with that service.
 - Review model-generated file changes before approving them.
@@ -344,7 +347,37 @@ Inspect the browser to see whether the prompt was submitted and whether the mode
 
 ## Related documentation
 
-- [README.md](README.md) — what AI Gateway does, its main features, and the current command overview.
+- [README.md](README.md) — what RelayPilot does, its main features, and the current command overview.
 - [Python downloads](https://www.python.org/downloads/)
 - [Python virtual environments](https://docs.python.org/3/library/venv.html)
 - [Playwright for Python](https://playwright.dev/python/docs/intro)
+
+
+## RelayPilot terminal interface
+
+After installing dependencies and starting the configured Chrome remote-debugging session, launch the full-screen terminal with:
+
+```bash
+python main.py
+```
+
+The header detects the provider/site name from the selected foreground browser tab (for example, ChatGPT, Claude, Gemini, or another host). This is site-level identity, not the exact model SKU (for example, GPT-4.1 or Claude Sonnet). Provider detection is not the same as provider support: the existing browser chat workflow is currently validated with ChatGPT only. Claude, Gemini, and other providers may be identified in the UI but are not enabled for prompt submission until their browser workflows are separately tested.
+
+Keyboard controls:
+
+- `Enter`: submit the prompt.
+- `Shift+Enter`: insert a newline, if the terminal reports the modifier. Some VS Code terminals transmit this as plain Enter; configure the keybindings in `VSCODE_TERMINAL_SHORTCUTS.md`.
+- `Alt+Enter`: insert newline when supported by the terminal (same setup options as Shift+Enter).
+- `Alt+N` or the `New line` button: fallback for terminals that cannot distinguish modified Enter keys.
+- `Escape`: close Help/Command Palette; otherwise stop the active request. In edit-approval and upload-recovery dialogs, Escape cancels the active request and dismisses the dialog. Browser-side stopping is best-effort when Playwright is inside a blocking operation.
+- `Alt+P`: open commands (also `Ctrl+P`, the `Commands` header button, or `/commands`).
+- `Alt+H`: show help (also `F1`, the `Help` header button, or `/help`).
+- `Alt+Q`: quit (also `Ctrl+Q`, the `Quit` header button, or `/exit`).
+- `Ctrl+R`: reconnect to Chrome.
+
+
+## Edit review and existing project settings
+
+In `/edit` mode, the UI does not dump the model's raw `<AI_EDIT>` protocol into the conversation. It validates the proposal, opens a scrollable edit diff for manual approval/rejection, and retains the outcome or validation error in chat history. Review diffs carefully before approving changes.
+
+RelayPilot writes workspace configuration to `.relaypilot/workspace.json`. If you have `.ai-gateway/workspace.json` from an earlier version, it is copied on the first run when the new file does not exist. Workspace IDs are preserved. Do not delete the old file until you have verified the new configuration and made a backup. New attachment settings use `RELAYPILOT_*` names, with existing `AI_GATEWAY_*` settings accepted as fallback aliases. The GitHub repository URL retains its existing name unless you rename the repository on GitHub yourself.

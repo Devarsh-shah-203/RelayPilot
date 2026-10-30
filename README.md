@@ -1,14 +1,14 @@
-# AI Gateway
+# RelayPilot
 
 **A terminal-first way to work with browser-based AI on your own codebase.**
 
-AI Gateway connects your terminal to an AI chat session already open in Chrome. It helps you ask questions about a project, provide relevant file context, keep reusable project notes, and propose code changes without having to manually copy and paste everything into a browser chat.
+RelayPilot connects your terminal to an AI chat session already open in Chrome. It helps you ask questions about a project, provide relevant file context, keep reusable project notes, and propose code changes without having to manually copy and paste everything into a browser chat.
 
 The aim is to make browser-based AI more useful for real development work—while keeping the developer in control of which context is shared and which file changes are applied.
 
 ## Table of contents
 
-* [Why AI Gateway?](#why-ai-gateway)
+* [Why RelayPilot?](#why-relaypilot)
 * [What can you do with it?](#what-can-you-do-with-it)
 
   * [Ask questions about your code](#ask-questions-about-your-code)
@@ -23,18 +23,18 @@ The aim is to make browser-based AI more useful for real development work—whil
 * [Where setup instructions belong](#where-setup-instructions-belong)
 * [License](#license)
 
-## Why AI Gateway?
+## Why RelayPilot?
 
 Using an AI chat while coding often means repeatedly switching windows, pasting code, explaining the project again, and manually transferring suggested changes back into files.
 
-AI Gateway brings several of those steps into one terminal workflow:
+RelayPilot brings several of those steps into one terminal workflow:
 
 * **Work from your terminal.** Send prompts to the chat session in your browser without manually moving every request between the terminal and browser.
 * **Give AI relevant project context.** Register your own project directories and refer to specific files in your prompt.
 * **Spend less time repeating project background.** Keep project knowledge in local memory files and choose when a memory snapshot should be included in a request.
 * **Review changes before they reach your files.** Use the explicit edit workflow to inspect a proposed change and its explanation, then approve or reject it.
 * **Keep projects organized.** Configure multiple workspaces and reference files using stable numeric IDs.
-* **Reuse browser-based AI access.** The current workflow uses an existing signed-in Chrome session rather than requiring an AI API key from AI Gateway itself.
+* **Reuse browser-based AI access.** The current workflow uses an existing signed-in Chrome session rather than requiring an AI API key from RelayPilot itself. The full-screen Textual interface delegates synchronous Playwright operations to a dedicated runtime thread so the terminal can remain responsive.
 
 ## What can you do with it?
 
@@ -61,7 +61,7 @@ Enter edit mode, describe the change, and reference the file you want to modify.
 Add input validation to <1/src/auth.js> and preserve the existing behavior.
 ```
 
-Review every proposed diff. AI Gateway is designed to keep you in the approval loop; it does not make model-generated code automatically trustworthy.
+Review every proposed diff. RelayPilot is designed to keep you in the approval loop; it does not make model-generated code automatically trustworthy.
 
 ### Maintain reusable project knowledge
 
@@ -83,7 +83,7 @@ Workspace configuration only registers directories for gateway workflows; removi
 
 ## How it fits together
 
-At a high level, AI Gateway connects a few pieces:
+At a high level, RelayPilot connects a few pieces:
 
 * **Browser transport** connects to an already-running Chrome session using Playwright.
 * **Prompt and context assembly** combines your request with the file context you explicitly reference and any memory snapshot that is enabled for that request.
@@ -112,7 +112,7 @@ Commands currently available in the CLI include:
 | `/save`                      | Extract durable knowledge from the current browser conversation and attempt to save a validated memory proposal. |
 | `/exit`                      | Exit the CLI.                                                                                                    |
 
-**Planned:** `/commands` will provide an in-terminal command index with syntax, descriptions, and examples. Focused help such as `/commands memory` or `/commands workspace` can make individual workflows easier to discover. This help command is not implemented in the current CLI yet.
+`/commands` provides an in-terminal command reference with syntax, descriptions, and examples. Focused help such as `/commands memory` or `/commands workspace` narrows the reference.
 
 ## Design principles
 
@@ -120,37 +120,74 @@ Commands currently available in the CLI include:
 * **Local-first project state:** Workspace settings and project memory are kept locally by default.
 * **Explicit file references:** The gateway should use files you identify, not guess which project file you meant.
 * **Focused responsibilities:** Browser transport, context assembly, memory, workspaces, and editing are separate components.
-* **Provider-agnostic direction:** The architecture aims to support different browser-based AI providers over time.
+* **Provider-agnostic direction:** The application and terminal contracts are provider-neutral; provider-specific browser workflows must still be implemented and validated individually.
 
 ## Current status and limitations
 
-AI Gateway is an active development project, not a finished or universally compatible coding agent.
+RelayPilot is an active development project, not a finished or universally compatible coding agent.
 
-* The current workflow has been developed around ChatGPT in Chrome. Other providers should not be considered supported until their flows have been tested.
+* The current prompt/response workflow is validated with ChatGPT in Chrome. The UI can identify Claude, Gemini, and other browser hosts, but does not yet enable their prompt workflows.
 * Browser interaction depends on the chat website's interface, which can change and break automation.
 * Chrome must remain open and reachable through remote debugging, with a valid signed-in session when required.
-* Browser service usage limits and account restrictions still apply. AI Gateway does not bypass them.
-* The in-terminal `/commands` help feature and detailed setup documentation are still planned.
+* Browser service usage limits and account restrictions still apply. RelayPilot does not bypass them.
+* The Textual terminal is integrated with the existing synchronous Playwright workflow through a dedicated runtime thread. Response text is updated progressively from browser DOM snapshots; this is not token-level SSE streaming. Live CDP operation must still be verified on the machine running Chrome.
 * Model responses and suggested edits can be incorrect. Review changes and use version control or backups for important work.
 
 ## Project structure
 
 ```text
-AI-gateway/
+RelayPilot/
 ├── browser/       # Chrome connection and browser-chat transport
 ├── context/       # Prompt/context assembly and memory-session behavior
 ├── files/         # File references, edit protocol, validation, diffs and writes
 ├── memory/        # Project-memory prompts, parsing, management and saving
-├── terminal/      # CLI display functions and edit approval
+├── application/   # Commands, request state and response storage
+├── runtime/       # Dedicated Playwright owner thread
+├── terminal/      # Textual UI, widgets, dialogs and command palette
 ├── workspace/     # Workspace registration, validation and persistence
-├── main.py        # Interactive CLI workflow
+├── main.py        # Full-screen Textual application
+├── main_legacy.py # Previous print-based CLI for rollback
 └── requirements.txt
 ```
 
 ## Where setup instructions belong
 
-This README focuses on what AI Gateway does and how it can help. Detailed installation, Chrome configuration, and environment-specific troubleshooting will be documented separately in `SETUP.md`.
+This README focuses on what RelayPilot does and how it can help. Detailed installation, Chrome configuration, and environment-specific troubleshooting will be documented separately in `SETUP.md`.
 
 ## License
 
 No license file is currently present in the repository. Until a license is added, do not assume that the code is available for unrestricted reuse, redistribution, or modification.
+
+
+## Running the terminal application
+
+Install dependencies and start the configured Chrome remote-debugging session as described in [SETUP.md](SETUP.md), then run:
+
+```bash
+python main.py
+```
+
+RelayPilot opens a full-screen Textual terminal. Press **Enter to send** and **Shift+Enter to insert a newline** (or Alt+N / the New line button if VS Code does not pass Shift+Enter correctly). See `VSCODE_TERMINAL_SHORTCUTS.md` for user-level VS Code keybindings that also restore Shift+Enter and Alt+Enter. To open commands, help, or quit, use the clickable header controls or type `/commands`, `/help`, or `/exit`. `Alt+P`, `Alt+H`, and `Alt+Q` are keyboard alternatives when VS Code intercepts `Ctrl+P`, `F1`, or `Ctrl+Q`. Use `Escape` to stop the active request (including while an approval or recovery dialog is open) and `Ctrl+R` to reconnect to Chrome. The header and status bar identify the detected provider/site (not necessarily the exact model SKU); Claude, Gemini, and other hosts are identified but their chat workflows remain disabled until implemented and validated. Escape closes Help or the command palette; elsewhere it cancels the active request.
+
+
+### Edit review in the terminal
+
+When `/edit` is enabled, model-generated `<AI_EDIT>` protocol text is **not** displayed as a normal assistant answer. RelayPilot keeps the raw response internally, validates it with the existing edit parser and validator, and opens a scrollable diff-review dialog for each proposed change. Use Approve/Reject (buttons or `A`/`R`). The applied/rejected outcome, or a parsing/validation error, remains visible in the conversation. Invalid proposals are never auto-applied.
+
+### Project name and configuration migration
+
+New workspace settings are stored in `.relaypilot/workspace.json`. On first use, RelayPilot copies an existing `.ai-gateway/workspace.json` into the new location, preserving workspace IDs and keeping the original for rollback. New environment variables use `RELAYPILOT_*`; older `AI_GATEWAY_*` names remain accepted for backward compatibility. Existing `<AI_EDIT>` tags are protocol identifiers and are **not** renamed.
+
+
+### Readable streamed replies and edit review
+
+The browser extraction layer now preserves bullet/numbered list markers, Markdown
+tables, headings and fenced code, rather than flattening them into bare text.
+The completed response is rendered with Rich Markdown. Request status (preparing,
+submitting, waiting, generating) is shown temporarily beneath the originating
+user message and disappears shortly after completion.
+
+In `/edit` mode, model-generated `<AI_EDIT>` protocol payloads remain hidden in
+the conversation but are preserved for the existing parser and validator.
+Successful proposals open a diff-approval dialog; malformed proposals show a
+persistent, actionable error. No change is applied without approval.
