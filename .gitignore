@@ -21,5 +21,6 @@ Thumbs.db
 
 .ai
 .ai-gateway
-tests/
-test.py
+.relaypilot/
+
+tests
