@@ -1,0 +1,191 @@
+/* RelayPilot: restrained developer-terminal palette. */
+Screen {
+    background: #101215;
+    color: #dfe1e3;
+}
+
+#app-shell {
+    height: 100%;
+    width: 100%;
+    padding: 0 1;
+}
+
+#topbar {
+    height: 2;
+    min-height: 2;
+    width: 100%;
+    padding: 0 1;
+    align-vertical: middle;
+}
+
+#brand {
+    width: 1fr;
+    color: #e3e5e7;
+    text-style: bold;
+    content-align: left middle;
+}
+
+#connection-label {
+    width: auto;
+    color: #777f89;
+    content-align: right middle;
+}
+
+#conversation {
+    height: 1fr;
+    width: 100%;
+    padding: 1 4;
+    background: #101215;
+    scrollbar-color: #343a42;
+    scrollbar-color-hover: #515a65;
+    scrollbar-background: #101215;
+}
+
+#conversation > #welcome-panel {
+    height: 1fr;
+    width: 100%;
+    align-horizontal: center;
+    align-vertical: middle;
+    padding: 0 2;
+}
+
+#welcome-title {
+    width: auto;
+    height: 1;
+    margin-bottom: 1;
+    color: #dfe1e3;
+    text-style: bold;
+    content-align: center middle;
+}
+
+#welcome-subtitle {
+    width: auto;
+    height: 1;
+    color: #a5abb3;
+    content-align: center middle;
+}
+
+#welcome-hint {
+    width: auto;
+    height: 1;
+    margin-top: 2;
+    color: #737b84;
+    content-align: center middle;
+}
+
+#composer {
+    height: 7;
+    min-height: 6;
+    max-height: 10;
+    width: 100%;
+    padding: 0 1;
+    background: #15181d;
+    border-top: solid #2a2e34;
+}
+
+#composer-caption {
+    height: 1;
+    margin-top: 1;
+    padding: 0 1;
+    color: #858b94;
+}
+
+#prompt-input {
+    height: 3;
+    min-height: 2;
+    max-height: 5;
+    width: 100%;
+    border: none;
+    padding: 0 1;
+    background: #15181d;
+    color: #e0e2e4;
+}
+
+#composer-footer {
+    height: 1;
+    width: 100%;
+    padding: 0 1;
+    layout: horizontal;
+}
+
+#composer-hint {
+    height: 1;
+    width: 1fr;
+    color: #747b84;
+}
+
+#stop-button {
+    display: none;
+    width: auto;
+    min-width: 8;
+    height: 1;
+    min-height: 1;
+    padding: 0;
+    margin: 0;
+    border: none;
+    background: transparent;
+    color: #b49a72;
+    text-style: bold;
+}
+
+#stop-button:hover {
+    background: #29251f;
+    color: #d1b68c;
+}
+
+#statusbar {
+    height: 1;
+    width: 100%;
+    padding: 0 1;
+    background: #1a1d22;
+    color: #858b94;
+}
+
+Footer {
+    height: 1;
+    background: #101215;
+    color: #777f89;
+}
+
+/* Keep modal styling consistent with the main screen. */
+CommandPaletteScreen > Vertical,
+HelpScreen > Vertical {
+    background: #171b20;
+    border: round #424a54;
+}
+
+UserInputScreen > Vertical,
+EditApprovalScreen > Vertical {
+    background: #171b20;
+    border: round #424a54;
+}
+
+/* Explicit, mouse-accessible commands for VS Code integrated terminals. */
+#topbar .nav-action {
+    width: auto;
+    min-width: 7;
+    height: 1;
+    min-height: 1;
+    padding: 0 1;
+    margin: 0 0 0 1;
+    border: none;
+    background: transparent;
+    color: #959da8;
+}
+#topbar .nav-action:hover {
+    color: #e0e3e6;
+    background: #2b3037;
+}
+
+#newline-button {
+    width: auto;
+    min-width: 10;
+    height: 1;
+    min-height: 1;
+    margin: 0;
+    padding: 0 1;
+    border: none;
+    background: transparent;
+    color: #8d95a0;
+}
+#newline-button:hover { background: #292f36; color: #d0d4d8; }

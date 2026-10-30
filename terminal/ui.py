@@ -6,7 +6,7 @@ from terminal.command_registry import get_header_commands
 def print_header(memory_mode="OFF"):
     print()
     print("=" * 56)
-    print("                    AI GATEWAY")
+    print("                    RELAYPILOT")
     print("=" * 56)
     mode = memory_mode
     if isinstance(memory_mode, dict):
