@@ -14,6 +14,7 @@ from playwright.sync_api import Page
 
 from attachments.models import AttachmentRecord, AttachmentStatus
 from attachments.policy import classify_file, exclusion_reason, FileKind
+from attachments.limits import UploadLimitKind, classify_upload_limit
 
 
 _FILE_INPUTS = 'input[type="file"]'
@@ -46,18 +47,6 @@ _ERROR_TERMS = (
     "maximum number of files", "maximum files per message", "maximum number of attachments",
     "select fewer files", "only upload up to", "limit on the number of files",
 )
-_LIMIT_TERMS = (
-    "file too large", "file is too large", "maximum file size", "max file size",
-    "file size limit", "upload limit", "too many files", "upload quota", "no more uploads",
-    "you've reached your file upload limit", "you have reached your file upload limit",
-    "you've reached your upload limit", "you have reached your upload limit",
-    "daily upload limit", "file uploads are currently unavailable",
-    "uploads are temporarily unavailable", "maximum number of files",
-    "maximum files per message", "maximum number of attachments", "select fewer files",
-    "only upload up to", "limit on the number of files",
-)
-
-
 @dataclass(frozen=True)
 class FileInputInfo:
     index: int
@@ -88,10 +77,11 @@ class BrowserAttachmentProvider:
 
     name = "base"
     domains: tuple[str, ...] = ()
-    # Conservative format family supported by AI Gateway. Live input accept
+    # Conservative format family supported by RelayPilot. Live input accept
     # attributes still decide which of these the selected provider input accepts.
     allowed_kinds = {
         FileKind.TEXT, FileKind.DOCUMENT, FileKind.IMAGE, FileKind.SPREADSHEET,
+        FileKind.ARCHIVE,
     }
 
     def __init__(self, page: Page, *, upload_timeout_floor: float = 30.0,
@@ -103,6 +93,20 @@ class BrowserAttachmentProvider:
 
     def prepare_for_upload(self, paths: Sequence[Path]) -> None:
         """Provider-specific menu-opening hook. Base provider needs no action."""
+
+    def preflight_upload_limit(self, paths: Sequence[Path]) -> str | None:
+        """Return a clearly visible account/session quota warning, if present.
+
+        This deliberately checks only active accessible error surfaces, never page
+        history or the sidebar. Providers do not expose remaining upload quota in a
+        reliable universal API, so ``None`` means no explicit warning was observed,
+        not that quota is guaranteed to be available.
+        """
+        snapshot = self._snapshot()
+        for alert in snapshot.alerts:
+            if classify_upload_limit(alert) == UploadLimitKind.PROVIDER_QUOTA:
+                return alert.strip()[:500]
+        return None
 
     def _composer_text(self) -> str:
         """Read only the active message composer, avoiding sidebar/chat-history text.
@@ -308,25 +312,90 @@ class BrowserAttachmentProvider:
         return output
 
     @staticmethod
-    def _extension(path: Path) -> str:
-        if path.name.lower() in {".gitignore", ".dockerignore", ".npmrc", ".editorconfig"}:
-            return path.name.lower()
-        return path.suffix.lower()
+    def _extensions(path: Path) -> set[str]:
+        """Return both ordinary and compound extensions for accept matching.
+
+        File inputs sometimes advertise ``.tar.gz`` while ``Path.suffix`` exposes
+        only ``.gz``. Keep both forms so the more specific provider filter and the
+        generic compression suffix can be honored.
+        """
+        name = path.name.casefold()
+        dotfiles = {".gitignore", ".dockerignore", ".npmrc", ".editorconfig"}
+        if name in dotfiles:
+            return {name}
+        suffixes = {suffix.casefold() for suffix in Path(name).suffixes}
+        suffixes.add(Path(name).suffix.casefold())
+        # Include the combined suffix for compressed tar archives.
+        for compound in (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst"):
+            if name.endswith(compound):
+                suffixes.add(compound)
+        return {item for item in suffixes if item}
+
+    @classmethod
+    def _extension(cls, path: Path) -> str:
+        """Backward-compatible primary extension helper."""
+        extensions = cls._extensions(path)
+        name = Path(path).name.casefold()
+        if name in {".gitignore", ".dockerignore", ".npmrc", ".editorconfig"}:
+            return name
+        for compound in (".tar.bz2", ".tar.gz", ".tar.xz", ".tar.zst"):
+            if name.endswith(compound):
+                return compound
+        return Path(path).suffix.casefold()
 
     @classmethod
     def _accepts(cls, accept: str, path: Path) -> bool:
-        if not accept.strip():
+        tokens = [part.strip().casefold() for part in (accept or "").split(",") if part.strip()]
+        # An absent accept filter or the universal MIME wildcard means the input
+        # advertises no format restriction. The live provider still decides whether
+        # its upload operation actually accepts the file.
+        if not tokens or "*" in tokens or "*/*" in tokens:
             return True
-        extension = cls._extension(path)
+
+        extensions = cls._extensions(path)
         mime, _encoding = mimetypes.guess_type(path.name)
-        for token in (part.strip().lower() for part in accept.split(",")):
-            if not token:
+        mime = mime.casefold() if mime else None
+        kind = classify_file(path)
+
+        for token in tokens:
+            if token.startswith(".") and token in extensions:
+                return True
+            if token == "application/octet-stream" and kind in {
+                FileKind.TEXT, FileKind.DOCUMENT, FileKind.IMAGE,
+                FileKind.SPREADSHEET, FileKind.ARCHIVE,
+            }:
+                # A generic binary input is compatible with the supported families;
+                # per-file validation and the real provider response remain decisive.
+                return True
+            if token.endswith("/*"):
+                media_family = token[:-2]
+                if mime and mime.startswith(media_family + "/"):
+                    return True
+                # MIME databases vary by OS. For a content-sniffed source file, a
+                # text/* input can be matched even if Python has no MIME mapping.
+                if media_family == "text" and kind == FileKind.TEXT:
+                    return True
+                # Some platforms lack MIME mappings for compressed and office
+                # formats; their classified family still belongs to application/*.
+                if media_family == "application" and kind in {
+                    FileKind.TEXT, FileKind.DOCUMENT, FileKind.SPREADSHEET,
+                    FileKind.ARCHIVE,
+                }:
+                    return True
                 continue
-            if token.startswith(".") and token == extension:
+            if mime and token == mime:
                 return True
-            if token.endswith("/*") and mime and mime.startswith(token[:-1]):
-                return True
-            if mime and token == mime.lower():
+
+        # Providers may advertise a narrow, text-oriented input which doesn't list
+        # newer source-language suffixes (for example .rs or .zig). Only positively
+        # classified UTF-8 text can use this compatibility path; images, PDFs,
+        # office documents, spreadsheets, and archives cannot match text filters.
+        if kind == FileKind.TEXT:
+            text_tokens = {
+                ".txt", ".text", ".md", ".csv", ".json", ".py", ".js", ".ts",
+                "text/plain", "text/*",
+            }
+            if any(token in text_tokens or token.startswith("text/") for token in tokens):
                 return True
         return False
 
@@ -397,10 +466,8 @@ class BrowserAttachmentProvider:
         attachment_count = 0
         progress_active = False
         alerts: tuple[str, ...] = ()
-        try:
-            body_text = self.page.locator("body").inner_text(timeout=3000)
-        except Exception:
-            pass
+        # Do not scan the full page body here. Chat history/sidebar text is not
+        # upload evidence and reading it can be expensive on long conversations.
         try:
             composer_text = self._composer_text()
         except Exception:
@@ -467,36 +534,114 @@ class BrowserAttachmentProvider:
             matched = next((term for term in _ERROR_TERMS if term in text), None)
             if not matched:
                 continue
-            if any(term in text for term in _LIMIT_TERMS):
+
+            limit_kind = classify_upload_limit(candidate)
+            if limit_kind in {
+                UploadLimitKind.BATCH_COUNT,
+                UploadLimitKind.FILE_SIZE,
+                UploadLimitKind.PROVIDER_QUOTA,
+            }:
                 status = AttachmentStatus.LIMIT_EXCEEDED
             elif any(term in text for term in (
                 "unsupported file", "file type isn't supported",
                 "file type is not supported", "not supported for upload",
             )):
                 status = AttachmentStatus.UNSUPPORTED
-            else:
+            elif any(term in text for term in (
+                "upload failed", "failed to upload", "couldn't upload",
+                "could not upload", "unable to upload", "failed to attach",
+            )):
                 status = AttachmentStatus.FAILED
+            else:
+                # A generic message such as "Upload limit reached" is not enough
+                # to distinguish per-file size, batch count, or account quota.
+                # Mark it uncertain to prevent automatic retry and false certainty.
+                status = AttachmentStatus.UNKNOWN
             return status, candidate.strip()[:500] or matched
         return None
 
     @staticmethod
-    def _new_filename_evidence(path: Path, before: PageSnapshot, after: PageSnapshot) -> bool:
-        """Require new filename evidence from the composer or a changed attachment node.
+    def _has_persistent_upload_warning(before: PageSnapshot, after: PageSnapshot) -> bool:
+        """Return true if the same upload-related warning remains visible.
 
-        A filename appearing somewhere in the full page is insufficient because it
-        might only be present in a historic message or a conversation title.
+        A warning that existed before file selection must not be ignored merely
+        because it did not change text. Otherwise filename evidence alone could
+        incorrectly mark a failed or blocked upload as attached.
         """
-        name = path.name.casefold()
+        previous = {item for item in before.alerts if any(term in item.casefold() for term in _ERROR_TERMS)}
+        current = {item for item in after.alerts if any(term in item.casefold() for term in _ERROR_TERMS)}
+        return bool(previous & current)
+
+    @staticmethod
+    def _map_batch_error(
+        paths: Sequence[Path],
+        before: PageSnapshot,
+        after: PageSnapshot,
+        error: tuple[AttachmentStatus, str],
+    ) -> dict[Path, tuple[AttachmentStatus, str, str]]:
+        """Map one provider error to cautious per-file outcomes.
+
+        Only a known batch-count limit permits strong filename evidence to count
+        as success for part of the batch. A size/quota/ordinary error plus a visible
+        filename remains uncertain because providers may display failed-file cards.
+        """
+        status, message = error
+        limit_kind = classify_upload_limit(message)
+        mapped: dict[Path, tuple[AttachmentStatus, str, str]] = {}
+        for path in paths:
+            filename_visible = BrowserAttachmentProvider._new_filename_evidence(
+                path, before, after
+            )
+            if status == AttachmentStatus.UNSUPPORTED:
+                mapped[path] = (status, message, "provider_error")
+            elif (
+                not after.progress_active
+                and filename_visible
+                and status == AttachmentStatus.LIMIT_EXCEEDED
+                and limit_kind == UploadLimitKind.BATCH_COUNT
+            ):
+                mapped[path] = (
+                    AttachmentStatus.ATTACHED,
+                    "Filename is visible in the active composer; a batch-count limit affected another item.",
+                    "filename_visible_partial_batch",
+                )
+            elif status == AttachmentStatus.LIMIT_EXCEEDED and not after.progress_active:
+                # Preserve explicit size/quota limits even if a failed-file chip is
+                # visible. The chip is not proof that upload completed.
+                mapped[path] = (status, message, "provider_error")
+            elif after.progress_active or filename_visible:
+                mapped[path] = (
+                    AttachmentStatus.UNKNOWN,
+                    "Provider reported an upload error, but filename/progress evidence is insufficient to determine this file's final state. "
+                    + message[:300],
+                    "uncertain_provider_error",
+                )
+            else:
+                mapped[path] = (status, message, "provider_error")
+        return mapped
+
+    @staticmethod
+    def _new_filename_evidence(path: Path, before: PageSnapshot, after: PageSnapshot) -> bool:
+        """Require exact new filename evidence from the composer or changed attachment nodes.
+
+        A filename appearing in history, a conversation title, or as a substring of
+        another filename is insufficient evidence that the requested file was staged.
+        """
+        name = path.name
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])",
+            re.IGNORECASE,
+        )
         composer_evidence = (
-            name in after.composer_text.casefold()
-            and name not in before.composer_text.casefold()
+            bool(pattern.search(after.composer_text))
+            and not bool(pattern.search(before.composer_text))
         )
         previous_metadata = set(before.attachment_metadata)
         new_metadata = [
             item for item in after.attachment_metadata
             if item not in previous_metadata
         ]
-        attachment_evidence = any(name in item.casefold() for item in new_metadata)
+        attachment_evidence = any(pattern.search(item) for item in new_metadata)
         return composer_evidence or attachment_evidence
 
     def _timeout_for(self, paths: Sequence[Path]) -> float:
@@ -513,12 +658,37 @@ class BrowserAttachmentProvider:
         stable_since: float | None = None
         last_change = start
         count_delta_seen = False
+        pending_error: tuple[AttachmentStatus, str] | None = None
         while time.monotonic() < deadline:
             after = self._snapshot()
-            error = self._error_from_snapshot(before, after)
-            if error:
-                status, message = error
-                return {path: (status, message, "provider_error") for path in paths}
+            observed_error = self._error_from_snapshot(before, after)
+            if observed_error:
+                pending_error = observed_error
+
+            # A warning already visible before selection may persist unchanged. It
+            # cannot prove this upload failed, but it also prevents us from treating
+            # a newly visible filename as proof of success while the warning remains.
+            if self._has_persistent_upload_warning(before, after) and not after.progress_active:
+                warning_text = next(
+                    (item for item in after.alerts if any(term in item.casefold() for term in _ERROR_TERMS)),
+                    "An existing upload warning remained visible.",
+                )
+                return {
+                    path: (
+                        AttachmentStatus.UNKNOWN,
+                        "An upload warning remained visible across this selection; the file state is uncertain. "
+                        + warning_text[:300],
+                        "persistent_upload_warning",
+                    )
+                    for path in paths
+                }
+
+            # If the provider reports a problem while upload activity is still
+            # visible, wait for that activity to settle before deciding which files
+            # succeeded. If it never settles, the final states remain UNKNOWN and
+            # will require a user decision instead of an automatic duplicate retry.
+            if pending_error and not after.progress_active:
+                return self._map_batch_error(paths, before, after, pending_error)
 
             signature = (
                 after.composer_text, after.attachment_metadata,
@@ -571,10 +741,9 @@ class BrowserAttachmentProvider:
             time.sleep(self.poll_interval)
 
         final = self._snapshot()
-        error = self._error_from_snapshot(before, final)
+        error = self._error_from_snapshot(before, final) or pending_error
         if error:
-            status, message = error
-            return {path: (status, message, "provider_error") for path in paths}
+            return self._map_batch_error(paths, before, final, error)
         # If file selection did change the attachment DOM but completion is not
         # proven, return UNKNOWN. The manager will not blindly retry this state.
         return {

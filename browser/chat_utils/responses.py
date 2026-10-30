@@ -9,6 +9,8 @@ from typing import List, Optional, Tuple
 
 from playwright.sync_api import Locator
 
+from .markdown_extraction import ANSWER_TO_MARKDOWN_JS
+
 from .selectors import (
     _ASSISTANT_SELECTORS,
     _GENERIC_MESSAGE_SELECTORS,
@@ -21,54 +23,15 @@ class ResponseExtractionMixin:
 
     @staticmethod
     def _extract_element_text(locator: Locator) -> str:
-        """Extract readable text while preserving line breaks and code blocks."""
+        """Serialize the visible assistant DOM to Markdown, preserving lists and tables.
+
+        Only assistant-originated nodes are passed here by the caller. DOM
+        serialization happens in the browser without introducing terminal UI
+        dependencies into Playwright. Falls back to plain text on DOM failures.
+        """
         try:
-            value = locator.evaluate(
-                r"""element => {
-                    const clone = element.cloneNode(true);
-                    clone.querySelectorAll(
-                        'button, [role="button"], svg, nav, footer, [aria-hidden="true"], [data-copy-button]'
-                    ).forEach(node => node.remove());
-
-                    // Replace code blocks with placeholders before normalizing
-                    // surrounding prose, so blank lines/indentation in code stay intact.
-                    const codeBlocks = [];
-                    clone.querySelectorAll('pre').forEach(pre => {
-                        const code = pre.querySelector('code');
-                        const content = code ? (code.textContent || '') : (pre.textContent || '');
-                        const token = `__AI_GATEWAY_CODE_BLOCK_${codeBlocks.length}__`;
-                        codeBlocks.push(content);
-                        pre.replaceWith(document.createTextNode(token));
-                    });
-
-                    const blockTags = new Set([
-                        'address', 'article', 'blockquote', 'dd', 'div', 'dl', 'dt',
-                        'fieldset', 'figcaption', 'figure', 'h1', 'h2', 'h3', 'h4',
-                        'h5', 'h6', 'li', 'ol', 'p', 'section', 'table', 'tbody',
-                        'td', 'th', 'tr', 'ul'
-                    ]);
-
-                    function readNode(node) {
-                        if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
-                        if (node.nodeType !== Node.ELEMENT_NODE) return '';
-                        const tag = node.tagName.toLowerCase();
-                        if (tag === 'br') return '\n';
-                        const children = Array.from(node.childNodes).map(readNode).join('');
-                        return blockTags.has(tag) ? '\n' + children + '\n' : children;
-                    }
-
-                    let text = readNode(clone).replace(/\r\n/g, '\n');
-                    text = text.replace(/\n{3,}/g, '\n\n');
-                    text = text.replace(/^\n+|\n+$/g, '');
-
-                    codeBlocks.forEach((content, index) => {
-                        const token = `__AI_GATEWAY_CODE_BLOCK_${index}__`;
-                        text = text.replace(token, '\n' + content + '\n');
-                    });
-                    return text;
-                }"""
-            )
-            return value or ""
+            result = locator.evaluate(ANSWER_TO_MARKDOWN_JS)
+            return result or ""
         except Exception:
             try:
                 return locator.inner_text().strip()

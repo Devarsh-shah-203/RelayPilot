@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from threading import Event
 from typing import Optional
 
 from .selectors import _GENERIC_MESSAGE_SELECTORS, _USER_SELECTORS
@@ -52,6 +53,7 @@ class SubmissionVerificationMixin:
         previous_assistant_count: Optional[int] = None,
         previous_generic_count: Optional[int] = None,
         timeout: Optional[float] = None,
+        cancel_event: Event | None = None,
     ) -> bool:
         """Confirm submission from the outgoing turn, composer, or new response.
 
@@ -104,6 +106,9 @@ class SubmissionVerificationMixin:
                 # Keep the established submission signals available even if a
                 # provider's response DOM cannot be inspected during this poll.
                 pass
+
+            if cancel_event is not None and cancel_event.is_set():
+                return False
 
             composer, _score = self._find_composer_on_page(
                 self.page, require_ready=False

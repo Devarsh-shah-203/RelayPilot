@@ -1,6 +1,6 @@
 """Provider-neutral browser chat transport built on Playwright.
 
-This module is the stable facade used by the rest of AI Gateway. Browser-page
+This module is the stable facade used by the rest of RelayPilot. Browser-page
 discovery, composer interaction, response extraction, page-state detection, and
 submission verification live in ``browser.chat_utils``. Keeping the public
 ``BrowserChat`` API here minimizes changes to callers and isolates responsibilities.
@@ -9,10 +9,16 @@ No file-attachment behavior is implemented in this refactor.
 """
 
 from __future__ import annotations
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
+from threading import Event
+import logging
+import re
 from playwright.sync_api import Browser, Locator, Page
-from browser.chat_utils.selectors import _COMPOSER_SELECTOR
+from browser.chat_utils.selectors import _COMPOSER_SELECTOR, _BUTTON_SELECTOR
+from browser.response_stream import ResponseChange, ResponseStreamTracker
 import time
+
+logger = logging.getLogger(__name__)
 
 
 from browser.chat_utils import (
@@ -72,18 +78,65 @@ class BrowserChat(
             )
 
 
+    def _click_stop_generation(self) -> bool:
+        """Click a visible provider stop control once; never click Send as fallback."""
+        try:
+            controls = self.page.locator(_BUTTON_SELECTOR)
+            for index in range(controls.count() - 1, -1, -1):
+                control = controls.nth(index)
+                try:
+                    if not control.is_visible() or not control.is_enabled():
+                        continue
+                    label = control.evaluate(
+                        """el => [
+                            el.innerText || '',
+                            el.getAttribute('aria-label') || '',
+                            el.getAttribute('title') || '',
+                            el.getAttribute('data-testid') || '',
+                            ...Array.from(el.querySelectorAll('[aria-label], [title], [data-testid]'))
+                                .flatMap(n => [n.getAttribute('aria-label') || '',
+                                               n.getAttribute('title') || '',
+                                               n.getAttribute('data-testid') || ''])
+                        ].join(' ').toLowerCase()"""
+                    )
+                    if re.search(r"\b(stop|cancel|interrupt)(?:[-_ ](?:generating|generation|response|streaming))?\b", label):
+                        control.click(timeout=1500)
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            logger.debug("Could not inspect generation stop controls", exc_info=True)
+        return False
+
+    def _clear_composer_if_matches(self, prompt: str) -> None:
+        """Clear only the exact prompt inserted by this request, never user drafts."""
+        try:
+            composer = self._wait_for_composer(1.0)
+            if composer is None:
+                return
+            current = self._normalize_text(self._read_composer_text(composer))
+            if current == self._normalize_text(prompt):
+                composer.fill("", timeout=1500)
+        except Exception:
+            logger.debug("Could not clear pre-submission cancelled prompt", exc_info=True)
+
     def wait_for_response(
         self,
         previous_text: str,
         previous_assistant_count: Optional[int] = None,
         previous_generic_count: Optional[int] = None,
         previous_media_signature: Tuple[str, ...] = (),
+        *,
+        cancel_event: Event | None = None,
+        on_state: Callable[[str, str | None], None] | None = None,
+        on_response_start: Callable[[], None] | None = None,
+        on_response_change: Callable[[ResponseChange], None] | None = None,
     ) -> Tuple[str, str]:
-        """Wait for a new assistant response and return its readable text.
+        """Wait for the current assistant turn, publishing incremental text updates.
 
-        Explicit image-generation requests receive a longer timeout. The waiter
-        also detects an image-only assistant turn, reports it in the terminal,
-        and returns any accompanying assistant text for the CLI to display.
+        Existing DOM polling and completion checks remain the reliability baseline.
+        The UI receives append-only deltas in the common case and full revisions
+        only when the provider changes text that was already displayed.
         """
         start = time.monotonic()
         timeout = (
@@ -97,28 +150,31 @@ class BrowserChat(
         stable_since: Optional[float] = None
         next_status_report = start + 10.0
         image_output_seen = False
-        image_notice_printed = False
+        response_started = False
+        stream = ResponseStreamTracker()
 
-        if self._active_image_generation:
-            print(
-                "Image-generation request detected. Waiting up to "
-                f"{timeout:g} seconds for the response and image output."
-            )
+        def publish_snapshot(snapshot: str) -> None:
+            nonlocal response_started
+            if not snapshot:
+                return
+            if not response_started:
+                response_started = True
+                if on_response_start:
+                    on_response_start()
+                if on_state:
+                    on_state("STREAMING", None)
+            change = stream.update(snapshot)
+            if change is not None and on_response_change:
+                on_response_change(change)
 
-        print(
-            "Response detector armed: "
-            f"assistant_nodes={self._assistant_count()}, "
-            f"generic_candidates={len(self._generic_message_items())}."
-        )
+        if on_state:
+            on_state("WAITING_FOR_RESPONSE", None)
 
         while True:
             state, information = self.detect_page_state()
             current_text = self.get_latest_assistant_text()
             assistant_count = self._assistant_count()
             generic_count = len(self._generic_message_items())
-            # Search for explicit generated-image markers on every turn, not only
-            # when the prompt heuristic predicted image generation. Natural prompts
-            # like "visual of BIT" can still cause the model to generate an image.
             current_media_signature = self._generated_image_signature()
 
             structured_response_added = (
@@ -133,17 +189,12 @@ class BrowserChat(
                 self._media_keys(current_media_signature)
                 - self._media_keys(previous_media_signature)
             ) and not image_output_seen
+
             if self._active_image_generation or new_media_response or image_output_seen:
                 if new_media_response:
-                    # An actual generated-image DOM marker is stronger evidence
-                    # than prompt wording. Extend the wait even for implicit requests.
                     self._active_image_generation = True
                     timeout = max(timeout, self.image_generation_timeout)
                 if new_media_response or image_output_seen:
-                # get_latest_assistant_text() may fall back to an older non-empty
-                # generic message when the new assistant turn contains only an
-                # image. Once media appears, keep reading the current response
-                # container on each poll so an old answer is never reused.
                     response_locator = self._latest_response_locator(
                         previous_assistant_count=previous_assistant_count,
                         previous_generic_count=previous_generic_count,
@@ -154,45 +205,69 @@ class BrowserChat(
                         if current_turn_text and self._normalize_text(current_turn_text) != self._normalize_text(previous_text):
                             current_text = current_turn_text
                         elif current_text == previous_text:
-                            # Never return stale text from the preceding turn for an
-                            # image-only response that has no readable message text.
                             current_text = ""
 
             new_text_response = bool(current_text and current_text != previous_text)
-
-            if (
-                structured_response_added
-                or generic_response_added
-                or new_text_response
-                or new_media_response
-            ):
+            if structured_response_added or generic_response_added or new_text_response or new_media_response:
                 saw_new_response = True
+
+            if new_text_response and current_text:
+                publish_snapshot(current_text.strip())
 
             if new_media_response:
                 image_output_seen = True
-                if not image_notice_printed:
-                    print(
-                        "\n[IMAGE OUTPUT DETECTED] The model generated an image. "
-                        "It is available in the browser. Waiting for the response "
-                        "and image to finish..."
-                    )
-                    image_notice_printed = True
+                publish_snapshot(current_text.strip())
+                if not current_text.strip() and on_response_change:
+                    # Preserve an image-only response in the text transcript while
+                    # the actual generated image remains available in the browser.
+                    if not response_started:
+                        response_started = True
+                        if on_response_start:
+                            on_response_start()
+                    change = stream.update("[Image generated in browser. Open the browser to view it.]")
+                    if change is not None:
+                        on_response_change(change)
 
-            # Some interfaces place image previews in dialog-like overlays. Once
-            # an actual new image output is observed, don't misclassify that
-            # preview as a request for user input.
             if state in {"RATE_LIMITED", "AUTH_REQUIRED", "USER_ACTION_REQUIRED"}:
-                if not (
-                    self._active_image_generation
-                    and image_output_seen
-                    and state == "USER_ACTION_REQUIRED"
-                ):
+                if not (self._active_image_generation and image_output_seen and state == "USER_ACTION_REQUIRED"):
                     return state, information or ""
+
+            now = time.monotonic()
+
+            # Cancellation is cooperative: the event is read between bounded
+            # Playwright operations. If generation is active, click the provider's
+            # stop control and verify it disappears. Completion may win the race.
+            if cancel_event is not None and cancel_event.is_set():
+                generation_active = self._is_generation_active()
+                if generation_active:
+                    clicked = self._click_stop_generation()
+                    if clicked:
+                        stop_deadline = time.monotonic() + 4.0
+                        while time.monotonic() < stop_deadline:
+                            if not self._is_generation_active():
+                                return "CANCELLED", stream.latest or current_text.strip()
+                            time.sleep(min(0.15, self.poll_interval))
+                        return "CANCEL_UNCONFIRMED", stream.latest or current_text.strip()
+                    return "CANCEL_UNCONFIRMED", stream.latest or current_text.strip()
+
+                # A completed turn wins if a visible answer has settled and the
+                # provider no longer reports generation as active.
+                if saw_new_response and current_text and stable_since is not None:
+                    send_control_available = self._send_control_available()
+                    if (
+                        now - stable_since >= self.response_stability
+                        and send_control_available is not False
+                    ):
+                        return "COMPLETED", current_text.strip()
+
+                # No active generation and no settled answer: the prompt may still
+                # be waiting to start, so report an unconfirmed cancellation rather
+                # than claiming that the remote request was stopped.
+                return "CANCEL_UNCONFIRMED", stream.latest or current_text.strip()
 
             image_media_ready = bool(current_media_signature) and all(
                 item.endswith("|ready") for item in current_media_signature
             )
-            now = time.monotonic()
             if saw_new_response and (current_text or image_output_seen):
                 content_changed = (
                     current_text != last_text
@@ -207,9 +282,6 @@ class BrowserChat(
 
                 generation_active = self._is_generation_active()
                 send_control_available = self._send_control_available()
-                # A known-missing/disabled Send control is supplementary evidence
-                # that the UI may still be processing. Unknown controls do not block
-                # completion on providers with nonstandard composer layouts.
                 submit_ui_not_ready = send_control_available is False
                 if (
                     stable_since is not None
@@ -225,56 +297,45 @@ class BrowserChat(
                             "browser. Open the browser to view it."
                         )
                         result = f"{result}\n\n{image_note}" if result else image_note
+                    publish_snapshot(result)
                     return "COMPLETED", result
             else:
                 stable_since = None
 
-            if now >= next_status_report:
-                print(
-                    f"[response wait: {int(now - start)}s] "
-                    f"assistant_nodes={assistant_count}, "
-                    f"generic_candidates={generic_count}, "
-                    f"latest_text_chars={len(current_text)}, "
-                    f"generation_active={self._is_generation_active()}, "
-                    f"send_control_available={self._send_control_available()}, "
-                    f"image_output_detected={image_output_seen}"
-                )
-                next_status_report = now + 10.0
-
             if now - start >= timeout:
                 state, information = self.detect_page_state()
-                if state is not None and not (
-                    image_output_seen and state == "USER_ACTION_REQUIRED"
-                ):
+                if state is not None and not (image_output_seen and state == "USER_ACTION_REQUIRED"):
                     return state, information or ""
                 diagnostic = self._response_diagnostic(current_text)
                 message = (
                     f"Timed out waiting for the response to finish after {timeout:g} seconds. "
                     f"Detector diagnostics: {diagnostic}"
                 )
-                print(f"[response timeout] {message}")
                 if current_text or image_output_seen:
                     partial = current_text.strip()
                     if image_output_seen:
-                        note = (
-                            "[IMAGE OUTPUT DETECTED] The image may still be generating; "
-                            "check the browser."
-                        )
+                        note = "[IMAGE OUTPUT DETECTED] The image may still be generating; check the browser."
                         partial = f"{partial}\n\n{note}" if partial else note
-                    # TIMEOUT_UNKNOWN is handled by the outer CLI without printing
-                    # the returned result. Display any available image-turn text
-                    # here so a long-running image operation doesn't hide it.
-                    if self._active_image_generation and partial:
-                        print("\n[PARTIAL MODEL RESPONSE BEFORE TIMEOUT]")
-                        print(partial)
+                    publish_snapshot(partial)
                     return "TIMEOUT_UNKNOWN", f"{partial}\n\n{message}"
                 return "TIMEOUT_UNKNOWN", message
 
-            time.sleep(self.poll_interval)
+            if cancel_event is not None:
+                cancel_event.wait(self.poll_interval)
+            else:
+                time.sleep(self.poll_interval)
 
 
-    def send_prompt(self, prompt: str) -> Tuple[str, str]:
-        """Send a single prompt and return ``(state, response_or_information)``.
+    def send_prompt(
+        self,
+        prompt: str,
+        *,
+        cancel_event: Event | None = None,
+        on_state: Callable[[str, str | None], None] | None = None,
+        on_response_start: Callable[[], None] | None = None,
+        on_response_change: Callable[[ResponseChange], None] | None = None,
+    ) -> Tuple[str, str]:
+        """Send a prompt and return ``(state, response_or_information)``.
 
         A prompt is never blindly inserted a second time and a clicked Send
         control is never blindly clicked again. Ambiguous outcomes return an
@@ -284,6 +345,10 @@ class BrowserChat(
             return "SEND_ERROR", "Prompt must be a string."
         if not prompt.strip():
             return "SEND_ERROR", "Prompt cannot be empty."
+        if cancel_event is not None and cancel_event.is_set():
+            return "CANCELLED", ""
+        if on_state:
+            on_state("PREPARING", None)
 
         # Mark the intended user turn before taking response baselines. The prompt
         # is not in the transcript yet, so the initial counts still describe only
@@ -308,12 +373,6 @@ class BrowserChat(
                 prompt, 10.0, minimum=10.0, maximum=60.0
             ) * 1000
         )
-        print(
-            "Prompt-size timeouts: "
-            f"insert/verify={insertion_timeout:.1f}s, "
-            f"send-control={send_timeout:.1f}s, "
-            f"submission-check={submission_timeout:.1f}s."
-        )
 
         previous_text = self.get_latest_assistant_text()
         previous_assistant_count = self._assistant_count()
@@ -322,7 +381,10 @@ class BrowserChat(
         previous_user_count = self._user_message_count()
 
         # STEP 1: wait for a visible editable composer.
-        composer = self._wait_for_composer(self.composer_timeout)
+        composer = self._wait_for_composer(self.composer_timeout, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            self._active_prompt = None
+            return "CANCELLED", ""
         if composer is None:
             self._active_prompt = None
             state, information = self.detect_page_state()
@@ -341,7 +403,8 @@ class BrowserChat(
         # A Playwright fill timeout does not prove that nothing was inserted: some
         # browser editors apply the text while their DOM is still updating. Never
         # return early merely because the composer is temporarily non-empty.
-        print("Inserting prompt...")
+        if on_state:
+            on_state("PREPARING", "Inserting and verifying the prompt")
         insertion_deadline = time.monotonic() + insertion_timeout
         fill_error: Optional[Exception] = None
         # Let fill attempt the operation, but reserve most of the prompt-size-scaled
@@ -356,7 +419,11 @@ class BrowserChat(
             fill_error = error
 
         remaining = max(0.0, insertion_deadline - time.monotonic())
-        inserted = self._wait_for_prompt_in_composer(prompt, timeout=remaining)
+        if cancel_event is not None and cancel_event.is_set():
+            self._clear_composer_if_matches(prompt)
+            self._active_prompt = None
+            return "CANCELLED", ""
+        inserted = self._wait_for_prompt_in_composer(prompt, timeout=remaining, cancel_event=cancel_event)
 
         if not inserted and fill_error is not None:
             # Recover with keyboard insertion only when every visible composer is
@@ -389,7 +456,7 @@ class BrowserChat(
             any_nonempty = any(value for value in visible_texts)
             remaining = max(0.0, insertion_deadline - time.monotonic())
             if not any_nonempty and remaining > 0:
-                current_composer = self._wait_for_composer(remaining)
+                current_composer = self._wait_for_composer(remaining, cancel_event=cancel_event)
                 if current_composer is not None:
                     try:
                         current_composer.click(timeout=min(3000, max(500, int(remaining * 1000))))
@@ -398,7 +465,7 @@ class BrowserChat(
                         self._active_prompt = None
                         return "SEND_ERROR", f"Could not insert prompt after an empty-composer recovery: {error}"
                     remaining = max(0.0, insertion_deadline - time.monotonic())
-                    inserted = self._wait_for_prompt_in_composer(prompt, timeout=remaining)
+                    inserted = self._wait_for_prompt_in_composer(prompt, timeout=remaining, cancel_event=cancel_event)
 
         if not inserted:
             self._active_prompt = None
@@ -422,21 +489,21 @@ class BrowserChat(
             )
 
         verification = getattr(self, "_last_prompt_verification", {})
-        if verification.get("verification") == "all_expected_chars_present_with_small_editor_extras":
-            print(
-                "Prompt inserted and verified; all expected content is present "
-                f"(editor exposed {verification.get('extra_observed_characters', 0)} additional character(s))."
-            )
-        else:
-            print("Prompt inserted and verified.")
+        if cancel_event is not None and cancel_event.is_set():
+            self._clear_composer_if_matches(prompt)
+            self._active_prompt = None
+            return "CANCELLED", ""
 
         # STEP 4: keep searching until a related Send/submit control is visible
         # and enabled. Its label or test ID is not required.
-        print("Waiting for the Send control to become available...")
         send_deadline = time.monotonic() + send_timeout
         send_button: Optional[Locator] = None
 
         while time.monotonic() < send_deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                self._clear_composer_if_matches(prompt)
+                self._active_prompt = None
+                return "CANCELLED", ""
             composer, _score = self._find_composer_on_page(
                 self.page, require_ready=False
             )
@@ -449,6 +516,11 @@ class BrowserChat(
                 break
             time.sleep(self.poll_interval)
 
+        if cancel_event is not None and cancel_event.is_set():
+            self._clear_composer_if_matches(prompt)
+            self._active_prompt = None
+            return "CANCELLED", ""
+
         if send_button is None:
             self._active_prompt = None
             return (
@@ -458,7 +530,12 @@ class BrowserChat(
             )
 
         # STEP 5: click exactly once, then verify acceptance rather than retrying.
-        #print("Submitting prompt...")
+        if on_state:
+            on_state("SUBMITTING", None)
+        if cancel_event is not None and cancel_event.is_set():
+            self._clear_composer_if_matches(prompt)
+            self._active_prompt = None
+            return "CANCELLED", ""
         submission_confirmed = False
         try:
             send_button.click(timeout=click_timeout_ms)
@@ -472,16 +549,16 @@ class BrowserChat(
                 previous_assistant_count,
                 previous_generic_count,
                 timeout=submission_timeout,
+                cancel_event=cancel_event,
             )
             if not submission_confirmed:
                 self._active_prompt = None
                 return (
-                    "SEND_ERROR",
+                    "SUBMISSION_UNKNOWN",
                     "The submit click could not be confirmed: "
                     f"{error}. The prompt was not automatically resent; check the browser.",
                 )
 
-        #print("Verifying that the prompt was accepted...")
         if not submission_confirmed and not self._wait_for_submission(
             prompt,
             previous_user_count,
@@ -489,21 +566,27 @@ class BrowserChat(
             previous_assistant_count,
             previous_generic_count,
             timeout=submission_timeout,
+            cancel_event=cancel_event,
         ):
             self._active_prompt = None
             return (
-                "SEND_ERROR",
+                "SUBMISSION_UNKNOWN",
                 "The submit control was clicked, but the page did not confirm acceptance. "
                 "The request was not retried to avoid sending a duplicate prompt.",
             )
 
-        print("Submission accepted. Waiting for the model response...")
+        if on_state:
+            on_state("SUBMITTED", None)
         try:
             return self.wait_for_response(
                 previous_text,
                 previous_assistant_count=previous_assistant_count,
                 previous_generic_count=previous_generic_count,
                 previous_media_signature=previous_media_signature,
+                cancel_event=cancel_event,
+                on_state=on_state,
+                on_response_start=on_response_start,
+                on_response_change=on_response_change,
             )
         finally:
             self._active_prompt = None

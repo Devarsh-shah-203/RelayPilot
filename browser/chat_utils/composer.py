@@ -7,10 +7,14 @@ from __future__ import annotations
 import time
 import unicodedata
 from typing import List, Optional, Tuple
+from threading import Event
+import logging
 
 from playwright.sync_api import Browser, Locator, Page
 
 from .selectors import _BUTTON_SELECTOR, _COMPOSER_SELECTOR
+
+logger = logging.getLogger(__name__)
 
 
 class ComposerMixin:
@@ -53,6 +57,17 @@ class ComposerMixin:
                     '[data-testid*="conversation-turn" i]'
                 ).count():
                     score += 8
+                # Prefer the foreground browser tab when several provider tabs
+                # expose equally plausible composers. This makes the provider
+                # shown by RelayPilot match the tab the user is actually viewing.
+                try:
+                    foreground = page.evaluate(
+                        "document.visibilityState === 'visible'"
+                    )
+                    if foreground:
+                        score += 1000
+                except Exception:
+                    pass
                 if score > best_score:
                     best_page = page
                     best_score = score
@@ -167,7 +182,7 @@ class ComposerMixin:
             return locator
         # Return a valid, empty locator rather than None for callers that inspect
         # count()/wait_for() on this legacy method.
-        return self.page.locator(".__ai_gateway_missing_composer__")
+        return self.page.locator(".__relaypilot_missing_composer__")
 
 
     def check_textbox_ready(self) -> Tuple[bool, str]:
@@ -180,15 +195,23 @@ class ComposerMixin:
         return True, ""
 
 
-    def _wait_for_composer(self, timeout: float) -> Optional[Locator]:
+    def _wait_for_composer(
+        self, timeout: float, cancel_event: Event | None = None
+    ) -> Optional[Locator]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             locator, _score = self._find_composer_on_page(
                 self.page, require_ready=True
             )
             if locator is not None:
                 return locator
-            time.sleep(self.poll_interval)
+            delay = min(self.poll_interval, max(0.0, deadline - time.monotonic()))
+            if cancel_event is not None:
+                cancel_event.wait(delay)
+            else:
+                time.sleep(delay)
         return None
 
 
@@ -281,7 +304,9 @@ class ComposerMixin:
         return expected_index == len(expected) and extras == extra_budget and extras <= max_extra
 
 
-    def _wait_for_prompt_in_composer(self, prompt: str, timeout: float) -> bool:
+    def _wait_for_prompt_in_composer(
+        self, prompt: str, timeout: float, cancel_event: Event | None = None
+    ) -> bool:
         """Poll visible composers until they contain the complete prompt.
 
         Do not rely only on the single highest-scoring composer: some chat UIs
@@ -296,6 +321,8 @@ class ComposerMixin:
         last_visible: list[dict[str, object]] = []
 
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             visible: list[dict[str, object]] = []
             try:
                 candidates = self.page.locator(_COMPOSER_SELECTOR)
@@ -349,9 +376,9 @@ class ComposerMixin:
                             "observed": visible,
                         }
                         if near_match and not exact_match:
-                            print(
-                                "Prompt verification: all expected characters are present; "
-                                f"the editor exposes {extra_characters} additional character(s)."
+                            logger.debug(
+                                "Prompt verified with %s editor-added character(s).",
+                                extra_characters,
                             )
                         return True
                 except Exception:
@@ -362,7 +389,11 @@ class ComposerMixin:
             last_visible = visible
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                time.sleep(min(self.poll_interval, remaining))
+                delay = min(self.poll_interval, remaining)
+                if cancel_event is not None:
+                    cancel_event.wait(delay)
+                else:
+                    time.sleep(delay)
 
         # Keep privacy-safe diagnostics: character counts and element types only,
         # never the prompt or attached project-memory content.
