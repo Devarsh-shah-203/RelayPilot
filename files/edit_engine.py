@@ -21,6 +21,9 @@ class EditEngine:
     def apply(self, validated_edit: ValidatedEdit, original_content: str) -> str:
         edit = validated_edit.edit
 
+        if edit.operation in {"create", "modify"}:
+            return edit.content
+
         if edit.operation == "replace":
             return self._replace(
                 original_content,
