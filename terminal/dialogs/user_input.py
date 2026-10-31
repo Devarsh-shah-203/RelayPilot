@@ -10,7 +10,7 @@ from textual.app import ComposeResult
 from textual.css.query import NoMatches
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, OptionList, Static
+from textual.widgets import Button, Checkbox, Input, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from terminal.dialogs.recovery_choices import (
@@ -142,13 +142,15 @@ class UserInputScreen(ModalScreen[str]):
                     id="recovery-choices",
                 )
                 if self.recovery.has_uncertain_upload and any(
-                    c.label.casefold().startswith(("retry upload", "append eligible", "skip the unresolved"))
+                    c.requires_cleanup
                     for c in self.recovery.choices
                 ):
                     yield Checkbox(
-                        "I checked Chrome and removed staged copies of the unresolved files",
+                        "I checked Chrome and removed unresolved staged attachment cards",
                         id="cleanup-check",
                     )
+            elif "MEMORY INITIAL CONTENT" in self.prompt:
+                yield TextArea("", id="memory-initial-content", soft_wrap=True)
             else:
                 yield Input(placeholder="Enter a choice…", id="user-input")
             with Horizontal(id="dialog-actions"):
@@ -156,7 +158,9 @@ class UserInputScreen(ModalScreen[str]):
                 yield Button("Continue", id="submit-input")
 
     def on_mount(self) -> None:
-        if self.recovery is None:
+        if "MEMORY INITIAL CONTENT" in self.prompt:
+            self.query_one("#memory-initial-content", TextArea).focus()
+        elif self.recovery is None:
             self.query_one("#user-input", Input).focus()
         else:
             options = self.query_one("#recovery-choices", OptionList)
@@ -191,9 +195,7 @@ class UserInputScreen(ModalScreen[str]):
         selected = next((c for c in self.recovery.choices if c.number == self._choice_number), None)
         needs_cleanup = bool(
             selected and self.recovery.has_uncertain_upload
-            and selected.label.casefold().startswith((
-                "retry upload", "append eligible", "skip the unresolved"
-            ))
+            and selected.requires_cleanup
         )
         checkbox = self._cleanup_checkbox()
         if checkbox is not None:
@@ -203,6 +205,9 @@ class UserInputScreen(ModalScreen[str]):
         )
 
     def _continue(self) -> None:
+        if "MEMORY INITIAL CONTENT" in self.prompt:
+            self.dismiss(self.query_one("#memory-initial-content", TextArea).text)
+            return
         if self.recovery is None:
             answer = self.query_one("#user-input", Input).value.strip()
             # Notebook cell/output selection deliberately supports empty input:
@@ -230,6 +235,8 @@ class UserInputScreen(ModalScreen[str]):
         return "include notebook cells" in text or "include outputs" in text
 
     def _cancel_value(self) -> str:
+        if "MEMORY INITIAL CONTENT" in self.prompt or "MEMORY FILENAME" in self.prompt:
+            return "CANCEL_MEMORY"
         if self.recovery is None:
             text = self.prompt.casefold()
             if self._is_notebook_selection():
