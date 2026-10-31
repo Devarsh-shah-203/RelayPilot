@@ -1,4 +1,4 @@
-"""Parse the provider-neutral AI Gateway edit protocol."""
+"""Parse the provider-neutral RelayPilot edit protocol."""
 
 from __future__ import annotations
 
@@ -237,7 +237,15 @@ class EditParser:
         """
         if not content:
             return content
-        lines = content.splitlines(keepends=True)
+        # Rendered browser Markdown often inserts an empty paragraph before or
+        # after the fenced CONTENT block. Ignore only those *outside* separator
+        # lines when a fence is present; preserve ordinary unfenced content and
+        # all whitespace inside the fence. An incomplete fence still fails.
+        candidate = content.strip("\r\n")
+        if re.match(r"^[ \t]*`{3,}", candidate):
+            lines = candidate.splitlines(keepends=True)
+        else:
+            lines = content.splitlines(keepends=True)
         if not lines:
             return content
 
