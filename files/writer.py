@@ -71,3 +71,22 @@ class FileWriter:
         except PermissionError as error:
             raise PermissionError(f"Permission denied: {path}") from error
 
+
+    def write_reviewed(self, validated_edit, content: str, *, create=False) -> None:
+        """Apply the reviewed bytes through pinned, non-symlink directory handles."""
+        from files.safe_paths import safe_write_bytes
+        if validated_edit.safe_target is None:
+            raise ValueError("A safe workspace target is required for approved writes.")
+        from files.edit_parser import NOTEBOOK_OPERATIONS
+        original = validated_edit.original_bytes or b""
+        if not create and validated_edit.edit.operation not in NOTEBOOK_OPERATIONS:
+            # Validation matches logical text; retain a uniformly used source
+            # newline convention when encoding the approved ordinary-file edit.
+            if b"\r\n" in original and b"\n" not in original.replace(b"\r\n", b""):
+                content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+            elif b"\r" in original and b"\n" not in original:
+                content = content.replace("\r\n", "\n").replace("\n", "\r")
+        safe_write_bytes(
+            validated_edit.safe_target, content.encode("utf-8"),
+            expected_bytes=validated_edit.original_bytes, create=create,
+        )
