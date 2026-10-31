@@ -63,11 +63,26 @@ Add input validation to <1/src/auth.js> and preserve the existing behavior.
 
 Review every proposed diff. RelayPilot is designed to keep you in the approval loop; it does not make model-generated code automatically trustworthy.
 
+### Create new files with approval
+
+Register an existing destination folder, including an empty one, and select its workspace ID when entering edit mode:
+
+```text
+/edit 1
+Create the backend for my TODO website.
+```
+
+The model can propose `CREATE` files and nested folders inside that workspace. Each proposal shows a **New file request** with a collapsed code preview and separate Apply/Reject controls. `MODIFY` keeps the existing review flow. Creation never overwrites an existing file, and missing input references remain errors. Deletes and model-created workspaces are unsupported.
+
+Bulk references such as `<1/all>` select eligible files recursively. For a literal file named `all`, use `<1/./all>`; for all files in a folder named `all`, use `<1/all/all>`. Numeric path segments, such as `<1/123/app.py>`, remain ordinary paths. Empty bulk selections are valid. The terminal lists selected, excluded, delivered and undelivered files with reasons. `RELAYPILOT_BULK_MAX_FILES` and `RELAYPILOT_BULK_MAX_BYTES` now cap the combined upload request, including memory; observed provider limits still use the existing recovery menu.
+
 ### Maintain reusable project knowledge
 
-Project memory lets you keep durable notes about architecture, decisions, conventions, and progress on your own machine. You control when that context is supplied to a normal prompt, rather than sending all local memory files with every request.
+RelayPilot keeps its memory inside the installed RelayPilot folder. Project memory lives in `RelayPilot/.ai/`, and its registry lives in `RelayPilot/.relaypilot/memory.json`. This keeps a shipped or cloned copy self-contained and independent of its parent folder or the terminal's current directory.
 
-The `/save` command asks the current browser conversation to identify useful long-term project knowledge and attempts to save a validated proposal to local memory files.
+Use `memory add architecture` to create a registered Markdown file with optional initial content; RelayPilot adds `.md` automatically. You can also use `memory renew` to register Markdown files you added to `.ai/` yourself. `memory` lists registered files. `memory refresh` includes their current contents in exactly the next model request, including `/edit`. The refresh remains pending if preparation fails before submission. Memory and referenced code share upload and fallback limits.
+
+The existing `/save` command still extracts and appends validated project notes. Use `memory renew` to register any new Markdown files it creates before refreshing memory. Its extraction format is unchanged.
 
 ### Work across more than one project
 
@@ -103,12 +118,12 @@ Commands currently available in the CLI include:
 | `/workspace add <directory>` | Register a project directory.                                                                                    |
 | `/workspace remove <id>`     | Remove a directory from the workspace configuration.                                                             |
 | `/workspace clear`           | Clear all workspace entries without deleting project files.                                                      |
-| `/edit`                      | Enter the controlled file-edit workflow.                                                                         |
+| `/edit [workspace_id]`       | Enter edit mode; optionally choose an existing workspace for new files.                                                                         |
 | `/cancel`                    | Leave edit mode.                                                                                                 |
-| `/memory use`                | Include project memory with the next normal prompt only.                                                         |
-| `/memory on`                 | Enable memory mode.                                                                                              |
-| `/memory off`                | Disable future memory injection.                                                                                 |
-| `/memory refresh`            | Queue the current memory snapshot for the next prompt.                                                           |
+| `memory`                     | List registered project memory files. |
+| `memory add [name]`          | Create and register Markdown memory; `.md` is added automatically. |
+| `memory renew`               | Register new Markdown files; report unsupported and missing files. |
+| `memory refresh [question]`  | Include memory once with the next model request, or the supplied question.                                                           |
 | `/save`                      | Extract durable knowledge from the current browser conversation and attempt to save a validated memory proposal. |
 | `/exit`                      | Exit the CLI.                                                                                                    |
 
@@ -146,7 +161,6 @@ RelayPilot/
 ├── terminal/      # Textual UI, widgets, dialogs and command palette
 ├── workspace/     # Workspace registration, validation and persistence
 ├── main.py        # Full-screen Textual application
-├── main_legacy.py # Previous print-based CLI for rollback
 └── requirements.txt
 ```
 
@@ -176,7 +190,7 @@ When `/edit` is enabled, model-generated `<AI_EDIT>` protocol text is **not** di
 
 ### Project name and configuration migration
 
-New workspace settings are stored in `.relaypilot/workspace.json`. On first use, RelayPilot copies an existing `.ai-gateway/workspace.json` into the new location, preserving workspace IDs and keeping the original for rollback. New environment variables use `RELAYPILOT_*`; older `AI_GATEWAY_*` names remain accepted for backward compatibility. Existing `<AI_EDIT>` tags are protocol identifiers and are **not** renamed.
+Workspace settings and the memory registry stay in `.relaypilot/` inside the RelayPilot clone; memory content stays in the clone's `.ai/` folder. On first use, RelayPilot copies an existing `.ai-gateway/workspace.json` into the new location, preserving workspace IDs and keeping the original for rollback. New environment variables use `RELAYPILOT_*`; older `AI_GATEWAY_*` names remain accepted for backward compatibility. Existing `<AI_EDIT>` tags are protocol identifiers and are **not** renamed.
 
 
 ### Readable streamed replies and edit review
