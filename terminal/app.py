@@ -201,12 +201,18 @@ class RelayPilotApp(App[None]):
                 if message is not None:
                     await message.replace_text(event.message)
 
+            if review_ids and not event.successful:
+                # A later failed write must not hide either earlier successes
+                # or its own actionable error below the individual review cards.
+                await self.query_one(ConversationView).add_message("assistant", event.message)
             status_bar.set_request_status(
-                "Edit review finished" if event.successful else "Edit proposal invalid"
+                "Edit review finished" if event.successful
+                else "Edit review has errors; see file outcomes" if review_ids
+                else "Edit proposal invalid"
             )
             self._set_request_progress(
                 event.request_id,
-                "● Review complete" if event.successful else "● Invalid edit proposal",
+                "● Review complete" if event.successful else "● Review has errors",
             )
             return
 
@@ -257,12 +263,16 @@ class RelayPilotApp(App[None]):
                 await message.finalize_markdown()
             elapsed = monotonic() - self._request_started_at.get(event.request_id or "", monotonic())
             if event.request_id in self._edit_review_failed_requests:
-                status_bar.set_request_status("Edit proposal invalid · no change approved")
+                status_bar.set_request_status(
+                    "Edit review has errors; see file outcomes"
+                    if self._review_request_ids.get(event.request_id or "")
+                    else "Edit proposal invalid; no change approved"
+                )
             else:
                 status_bar.set_request_status(f"Completed · {elapsed:.1f}s")
             self._complete_request_progress(
                 event.request_id,
-                "● Edit proposal invalid" if event.request_id in self._edit_review_failed_requests else "✓ Completed",
+                "● Review has errors" if event.request_id in self._edit_review_failed_requests else "✓ Completed",
             )
             self._finish_request(event.request_id)
             return
@@ -372,6 +382,11 @@ class RelayPilotApp(App[None]):
 
         if isinstance(event, AppNotice):
             severity = event.severity if event.severity in {"information", "warning", "error"} else "information"
+            # Inventories and memory lists remain available after a toast closes.
+            if event.title in {"Memory", "Workspace files", "Edit destination"}:
+                await self.query_one(ConversationView).add_message(
+                    "assistant", event.message
+                )
             self.notify(event.message, title=event.title, severity=severity, timeout=7)
             return
 
@@ -393,7 +408,7 @@ class RelayPilotApp(App[None]):
         results: dict[str, list[str]] = {}
         for line in message.splitlines():
             file_name, separator, status = line.rpartition(": ")
-            if separator and status.strip().upper() in {"APPLIED", "REJECTED"}:
+            if separator and status.strip().upper() in {"APPLIED", "REJECTED", "FAILED"}:
                 results.setdefault(file_name, []).append(status.strip().upper())
         return results
 
@@ -505,11 +520,14 @@ class RelayPilotApp(App[None]):
             self.action_show_help()
             return
 
+        # Bare memory commands share the slash-command router; display the
+        # user's original text and preserve ExecuteCommand's slash-only contract.
+        routed_prompt = "/" + prompt if prompt.split(None, 1)[0].casefold() == "memory" else prompt
         request_id = new_request_id()
-        if self._edit_mode and not prompt.startswith("/"):
+        if self._edit_mode and not routed_prompt.startswith("/"):
             self._edit_request_ids.add(request_id)
-        if prompt.startswith("/"):
-            command = ExecuteCommand(command_text=prompt, request_id=request_id)
+        if routed_prompt.startswith("/"):
+            command = ExecuteCommand(command_text=routed_prompt, request_id=request_id)
         else:
             command = SubmitPrompt(request_id=request_id, prompt=prompt)
 
