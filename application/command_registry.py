@@ -85,40 +85,24 @@ COMMANDS: tuple[CommandSpec, ...] = (
         examples=("/workspace clear",),
     ),
     CommandSpec(
-        name="/memory use [question]",
-        category="memory",
-        description="Without a question, include memory in the next normal prompt only. With a question, send it with memory for that request.",
-        usage="/memory use [question]",
-        examples=("/memory use", "/memory use Explain our architecture decisions."),
-        show_in_header=False,
-        header_hint="Use memory once",
+        name="/memory", category="memory",
+        description="List the registered Markdown memory files for this project. Bare memory commands also work.",
+        usage="memory", examples=("memory", "/memory"),
     ),
     CommandSpec(
-        name="/memory on [question]",
-        category="memory",
-        description="Enable memory mode. The current snapshot is loaded when needed, not resent with every prompt. An inline question is submitted now.",
-        usage="/memory on [question]",
-        examples=("/memory on", "/memory on Summarize our design decisions."),
-        show_in_header=False,
-        header_hint="Enable memory",
+        name="/memory refresh [question]", category="memory",
+        description="Include registered memory once in the next model request, including /edit. An optional question is sent now.",
+        usage="memory refresh [question]", examples=("memory refresh", "memory refresh Explain our architecture."),
     ),
     CommandSpec(
-        name="/memory off",
-        category="memory",
-        description="Disable future project-memory injection.",
-        usage="/memory off",
-        examples=("/memory off",),
-        show_in_header=False,
-        header_hint="Disable memory",
+        name="/memory add [name]", category="memory",
+        description="Create and register Markdown memory with optional initial content. The .md extension is added automatically.",
+        usage="memory add [name]", examples=("memory add architecture", "memory add"),
     ),
     CommandSpec(
-        name="/memory refresh [question]",
-        category="memory",
-        description="Queue the current memory snapshot for the next prompt. With a question, refresh and submit it in one step.",
-        usage="/memory refresh [question]",
-        examples=("/memory refresh", "/memory refresh Re-read our project decisions."),
-        show_in_header=False,
-        header_hint="Refresh memory",
+        name="/memory renew", category="memory",
+        description="Register new .ai Markdown files and report unsupported or missing files.",
+        usage="memory renew", examples=("memory renew",),
     ),
     CommandSpec(
         name="/save",
@@ -132,9 +116,9 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(
         name="/edit",
         category="edit",
-        description="Enter edit mode. Describe the change and reference the file(s); proposed changes require review and approval.",
-        usage="/edit",
-        examples=("/edit", "Add validation to <1/src/auth.js> while preserving existing behavior."),
+        description="Enter edit mode. Optionally select an existing workspace for new files. CREATE and MODIFY both require approval.",
+        usage="/edit [workspace_id]",
+        examples=("/edit", "/edit 1", "Add validation to <1/src/auth.js> while preserving existing behavior."),
         show_in_header=False,
         header_hint="Edit with approval",
     ),
@@ -199,15 +183,18 @@ def render_command_help(
         output("  Include a file inside a workspace subfolder.")
         output("<workspace_id/all>")
         output("  Collect eligible files recursively from a workspace; each file uses the normal inline/attachment policy.")
+        output("<workspace_id/./all>")
+        output("  Select a literal file named all; ./ disables bulk interpretation. Numeric path segments are ordinary paths.")
+        output("  Read a folder named all with <workspace_id/all/all> (the last all is the selector).")
         output("<workspace_id/folder/all>")
         output("  Collect eligible files recursively from that subfolder; each file uses the normal inline/attachment policy.")
         output("  Bulk collection skips generated folders, secrets/local config, unsupported/binary files,")
         output("  and Jupyter notebooks. Supported images, documents, spreadsheets, and archives may be attached.")
         output("  Safety caps: RELAYPILOT_BULK_MAX_FILES (default 200) and RELAYPILOT_BULK_MAX_BYTES (default 100 MiB).")
         output("  Reference a notebook individually (for example <1/notebooks/eda.ipynb>) to select its cells.")
-        output("  Text/source files use attachments above 20,000 characters or 1 MiB by default.")
+        output("  Explicit eligible references upload first, including small source files and /edit requests.")
         output("  Configure RELAYPILOT_ATTACHMENT_CHAR_THRESHOLD, RELAYPILOT_ATTACHMENT_SIZE_MB, and RELAYPILOT_INLINE_TOKEN_THRESHOLD.")
-        output("  Inline fallback after upload failure is limited to .txt and source/programming-language files.")
+        output("  Inline fallback uses complete eligible text/source or approved notebook content, within the shared request budget.")
 
     output("\nUse /commands workspace, /commands memory, /commands files, or /commands edit")
     output("to view focused help. File references are syntax inside prompts, not slash commands.")
