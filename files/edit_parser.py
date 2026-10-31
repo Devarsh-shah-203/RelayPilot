@@ -14,6 +14,8 @@ EDIT_PATTERN = re.compile(
 )
 
 ALLOWED_OPERATIONS = {
+    "create",
+    "modify",
     "replace",
     "insert_before",
     "insert_after",
