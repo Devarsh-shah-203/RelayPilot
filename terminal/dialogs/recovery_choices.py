@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import re
 
 _OPTION = re.compile(r"^\s*\[(\d+)\]\s+(.+?)\s*$")
-from attachments.recovery_ui_protocol import CONFIRMED_RETRY_PREFIX, CONFIRMED_CLEANUP_PREFIX
+from attachments.recovery_ui_protocol import CONFIRMED_CLEANUP_PREFIX, CONFIRMED_RETRY_PREFIX
 
 
 @dataclass(frozen=True)
@@ -20,13 +20,6 @@ class RecoveryChoice:
     @property
     def is_retry(self) -> bool:
         return self.label.casefold().startswith("retry upload")
-
-    @property
-    def needs_cleanup(self) -> bool:
-        # An UNKNOWN upload may still have a staged file in the composer.
-        # Retry, inline and skip all need acknowledgement of manual cleanup.
-        lowered = self.label.casefold()
-        return lowered.startswith(("retry upload", "send as prompt", "append eligible", "skip "))
 
 
 @dataclass(frozen=True)
@@ -70,11 +63,12 @@ def encode_recovery_choice(menu: RecoveryPrompt, choice_number: str, *, cleanup_
     selected = next((c for c in menu.choices if c.number == choice_number), None)
     if selected is None:
         raise ValueError("Unknown attachment recovery choice")
-    if selected.needs_cleanup and menu.has_uncertain_upload:
+    if menu.has_uncertain_upload and selected.label.casefold().startswith((
+        "retry upload", "append eligible", "skip the unresolved"
+    )):
         if not cleanup_checked:
-            raise ValueError("Check Chrome and acknowledge that unresolved attachment cards were removed")
-        if selected.is_retry:
-            return f"{CONFIRMED_RETRY_PREFIX}{selected.number}"
-        return f"{CONFIRMED_CLEANUP_PREFIX}{selected.number}"
+            raise ValueError("Check Chrome and acknowledge that staged copies were cleared before continuing")
+        prefix = CONFIRMED_RETRY_PREFIX if selected.is_retry else CONFIRMED_CLEANUP_PREFIX
+        return f"{prefix}{selected.number}"
     return selected.number
 

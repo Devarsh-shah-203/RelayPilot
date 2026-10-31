@@ -141,7 +141,10 @@ class UserInputScreen(ModalScreen[str]):
                     ],
                     id="recovery-choices",
                 )
-                if self.recovery.has_uncertain_upload and any(c.needs_cleanup for c in self.recovery.choices):
+                if self.recovery.has_uncertain_upload and any(
+                    c.label.casefold().startswith(("retry upload", "append eligible", "skip the unresolved"))
+                    for c in self.recovery.choices
+                ):
                     yield Checkbox(
                         "I checked Chrome and removed staged copies of the unresolved files",
                         id="cleanup-check",
@@ -186,7 +189,12 @@ class UserInputScreen(ModalScreen[str]):
         if self.recovery is None or not self.is_mounted:
             return
         selected = next((c for c in self.recovery.choices if c.number == self._choice_number), None)
-        needs_cleanup = bool(selected and selected.needs_cleanup and self.recovery.has_uncertain_upload)
+        needs_cleanup = bool(
+            selected and self.recovery.has_uncertain_upload
+            and selected.label.casefold().startswith((
+                "retry upload", "append eligible", "skip the unresolved"
+            ))
+        )
         checkbox = self._cleanup_checkbox()
         if checkbox is not None:
             checkbox.display = needs_cleanup
@@ -197,7 +205,10 @@ class UserInputScreen(ModalScreen[str]):
     def _continue(self) -> None:
         if self.recovery is None:
             answer = self.query_one("#user-input", Input).value.strip()
-            self.dismiss(answer or "0")
+            # Notebook cell/output selection deliberately supports empty input:
+            # it means the documented default (all cells / no outputs). Do not
+            # turn a blank notebook answer into index 0.
+            self.dismiss(answer if self._is_notebook_selection() else answer or "0")
             return
         try:
             checkbox = self._cleanup_checkbox()
@@ -214,8 +225,21 @@ class UserInputScreen(ModalScreen[str]):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self._continue()
 
+    def _is_notebook_selection(self) -> bool:
+        text = self.prompt.casefold()
+        return "include notebook cells" in text or "include outputs" in text
+
+    def _cancel_value(self) -> str:
+        if self.recovery is None:
+            text = self.prompt.casefold()
+            if self._is_notebook_selection():
+                return "CANCEL_NOTEBOOK"
+            if "temporary notebook" in text and "fewer" in text:
+                return "CANCEL"
+        return "0"
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "submit-input":
             self._continue()
         elif event.button.id == "cancel-input":
-            self.dismiss("0")
+            self.dismiss(self._cancel_value())

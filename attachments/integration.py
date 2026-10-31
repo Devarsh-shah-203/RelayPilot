@@ -85,7 +85,7 @@ class AttachmentPlan:
 
     @property
     def inline_fallback_candidates(self) -> list[Path]:
-        """Eligible text/source files may use a bounded prompt fallback."""
+        """Only TXT and source/programming-language files may use text fallback."""
         return [path for path in self.attachment_paths if is_inline_fallback_eligible(path)]
 
 
@@ -376,7 +376,7 @@ def plan_referenced_files(
         kind = classify_file(path)
         workspace_root = _workspace_root(workspace_manager, workspace_id)
         reason = exclusion_reason(path, root=workspace_root)
-        if reason and kind != FileKind.NOTEBOOK:
+        if reason and not (kind == FileKind.NOTEBOOK and reason == "notebook files use the existing cell-aware context workflow"):
             raise ValueError(f"Cannot use <{key}>: {reason}.")
         if kind == FileKind.UNKNOWN:
             raise ValueError(f"Cannot use <{key}>: file type is binary or unsupported by the default policy.")
@@ -456,8 +456,10 @@ def _choose_inline_fallback(
     token_threshold: int,
     input_fn: Callable[[str], str],
     output_fn: Callable[[str], None],
+    inline_payloads: dict[Path, str] | None = None,
+    quota_text_paths: set[Path] | None = None,
 ) -> list[Path] | None:
-    """Choose safe bounded UTF-8 fallback; None means cancel."""
+    """Select complete, budgeted source or prepared notebook text (never truncated)."""
     max_total_chars = max(0, token_threshold * 3 - max(0, inline_base_characters))
     if max_total_chars <= 0:
         output_fn("The current prompt and inline context leave no room for fallback text under the configured token budget.")
@@ -467,9 +469,15 @@ def _choose_inline_fallback(
     too_large: list[Path] = []
     for raw_path in candidates:
         path = Path(raw_path).expanduser().resolve()
-        if not is_inline_fallback_eligible(path):
+        override = (inline_payloads or {}).get(path)
+        regular_text = is_inline_fallback_eligible(path)
+        quota_text = path in (quota_text_paths or set()) and classify_file(path) == FileKind.TEXT and exclusion_reason(path) is None
+        if override is None and not (regular_text or quota_text):
             continue
-        text = _inline_candidate_text(path, max_total_chars)
+        text = override if override is not None and len(override) <= max_total_chars else (
+            _safe_read_text(path, max_characters=max_total_chars) if quota_text else
+            _inline_candidate_text(path, max_total_chars) if override is None else None
+        )
         if text is None:
             too_large.append(path)
         else:
@@ -480,22 +488,14 @@ def _choose_inline_fallback(
         for path in too_large:
             output_fn(f"  - {path.name}")
     if not candidate_texts:
-        output_fn("No failed text/source files can fit in the inline fallback budget.")
+        output_fn("No failed TXT/source-code files can fit in the inline fallback budget.")
         return None
 
     ordered = list(candidate_texts)
     output_fn("\nEligible inline fallback files:")
     for index, path in enumerate(ordered, start=1):
         output_fn(f"  [{index}] {path.name} ({len(candidate_texts[path]):,} characters)")
-    output_fn("Only safe text/source files are eligible; binary files, notebooks, PDFs, office files and archives cannot be inlined directly.")
-
-    # The recovery choice already authorizes sending eligible text inline.
-    # If every eligible file fits together, include them all without a second
-    # popup. When the budget does not fit, ask for an explicit subset.
-    all_characters = sum(len(candidate_texts[path]) for path in ordered)
-    total = inline_base_characters + all_characters + _INLINE_PER_FILE_OVERHEAD_CHARS * len(ordered)
-    if estimate_tokens(total)[1] <= token_threshold:
-        return ordered
+    output_fn("Fallback is available only for complete, approved text/source content or selected notebook cell context. No content is truncated.")
 
     while True:
         try:
@@ -531,6 +531,8 @@ def _settle_upload_failure(
     allow_retry: bool,
     input_fn: Callable[[str], str],
     output_fn: Callable[[str], None],
+    inline_payloads: dict[Path, str] | None = None,
+    allow_notebook_reselect: bool = False,
 ) -> UploadDecision:
     """Never submit a missing/unknown attachment without an explicit decision.
 
@@ -541,11 +543,17 @@ def _settle_upload_failure(
     unresolved = [r for r in report.records if r.status != AttachmentStatus.ATTACHED]
     paths = [Path(r.path).resolve() for r in unresolved]
     uncertain = [r for r in unresolved if r.status == AttachmentStatus.UNKNOWN]
-    limit_records = [r for r in unresolved if r.status == AttachmentStatus.LIMIT_EXCEEDED]
-    quota = [r for r in limit_records if classify_upload_limit(r.message) == UploadLimitKind.PROVIDER_QUOTA]
+    has_limit = any(r.status == AttachmentStatus.LIMIT_EXCEEDED for r in unresolved)
+    quota_text_paths = {
+        Path(record.path).resolve() for record in unresolved
+        if record.status == AttachmentStatus.LIMIT_EXCEEDED
+        and classify_file(record.path) == FileKind.TEXT
+        and exclusion_reason(record.path) is None
+    }
     allowed_for_inline = {
         Path(path).resolve() for path in fallback_candidates
-        if is_inline_fallback_eligible(path)
+        if is_inline_fallback_eligible(path) or Path(path).resolve() in (inline_payloads or {})
+        or Path(path).resolve() in quota_text_paths
     }
     fallback_paths = [
         Path(r.path).resolve() for r in unresolved
@@ -555,38 +563,28 @@ def _settle_upload_failure(
     output_fn("Attachment upload needs your decision (the prompt has NOT been sent):")
     for record in unresolved:
         output_fn(f"  - {record.path.name}: {record.status.value} — {record.message}")
-    if quota:
-        output_fn(
-            "UPLOAD LIMIT REACHED: The provider reported an upload quota/allowance warning. "
-            "Further uploads may not work right now. Choose Send as prompt to include "
-            "eligible text files instead, within the request budget."
-        )
-    elif limit_records:
-        output_fn(
-            "UPLOAD LIMIT DETECTED: The provider reported an attachment size/count limit. "
-            "Eligible text files may be delivered in the prompt instead."
-        )
+    if has_limit:
+        messages = [record.message for record in unresolved if record.status == AttachmentStatus.LIMIT_EXCEEDED]
+        if any(classify_upload_limit(message) == UploadLimitKind.PROVIDER_QUOTA for message in messages):
+            output_fn("UPLOAD QUOTA REACHED: ChatGPT reports exhausted uploads. Choose an eligible inline fallback; do not retry until the quota resets.")
+        else:
+            output_fn("UPLOAD LIMIT DETECTED: a file-size or batch limit was reported. This is not necessarily an account upload quota.")
     if uncertain:
         output_fn(
             "UNKNOWN means a file may already be present in the composer. "
-            "Check Chrome and remove any unresolved attachment cards before retrying, "
-            "sending file content in the prompt, or skipping files. "
-            "RelayPilot will not silently skip such a file and send it anyway. "
-            "UNKNOWN does NOT establish that an upload quota was reached."
+            "Check Chrome and remove any unresolved attachment cards before retrying. "
+            "RelayPilot will not silently skip such a file and send it anyway."
         )
 
     retry_paths = [r for r in unresolved if r.status in {AttachmentStatus.FAILED, AttachmentStatus.UNKNOWN}]
     choices: list[tuple[str, str]] = []
-    if allow_retry and retry_paths and not limit_records:
+    if allow_retry and retry_paths and not has_limit:
         choices.append(("retry", "Retry upload once (after checking the browser for any UNKNOWN files)"))
     if fallback_paths:
-        incompatible = [r for r in unresolved if Path(r.path).resolve() not in fallback_paths]
-        label = "Send as prompt: append eligible text/source contents (no attachment)"
-        if incompatible:
-            label += " — other unresolved files will be omitted"
-            output_fn("Some unresolved files cannot be sent as prompt text: " + ", ".join(r.path.name for r in incompatible))
-        choices.append(("inline", label))
-    choices.append(("skip", "Skip unresolved files and send the prompt without them"))
+        choices.append(("inline", "Append eligible source/TXT or selected notebook contents to the prompt"))
+    if allow_notebook_reselect and (has_limit or any(r.status == AttachmentStatus.UNSUPPORTED for r in unresolved)) and not uncertain:
+        choices.append(("reselect", "Choose fewer notebook cells/outputs (retry selection)"))
+    choices.append(("skip", "Skip the unresolved files and send the prompt without them"))
     choices.append(("cancel", "Cancel this request"))
 
     output_fn("Choose how to proceed:")
@@ -607,20 +605,15 @@ def _settle_upload_failure(
         "cancel",
     )
 
-    # A staged UNKNOWN card can accidentally accompany an inline-only request.
-    # Require the same explicit Chrome-cleanup acknowledgement for any action
-    # that would submit, not only for retry. A Textual checkbox sends the
-    # CLEANUP_CHECKED marker; text-based callers can type CLEAR (case-insensitive).
-    if uncertain and selected != "cancel" and not cleanup_checked:
+    if selected in {"retry", "inline", "skip"} and uncertain and not cleanup_checked:
+        # A UI checkbox is enough. In plain CLI mode, the separate text
+        # confirmation remains available as a conservative fallback.
         confirmation = input_fn(
-            "Remove staged copies of the unresolved files in Chrome, "
-            "then type CLEAR to confirm: "
+            "Remove staged copies of unresolved files in Chrome, then type CLEAN to confirm: "
         ).strip()
-        if confirmation.casefold() not in {"clear", "cleared"} and not (
-            selected == "retry" and confirmation.casefold() == "retry"
-        ):
-            output_fn("Attachment cleanup not confirmed; no prompt was submitted.")
-            return UploadDecision(False, attached, paths, report, "Composer cleanup not confirmed.")
+        if confirmation.casefold() not in {"clean", "retry"}:
+            return UploadDecision(False, attached, paths, report, "Uncertain browser staging was not cleared.")
+        cleanup_checked = True
 
     if selected == "retry":
         retry_report = manager.upload(
@@ -646,6 +639,8 @@ def _settle_upload_failure(
             inline_base_characters=inline_base_characters,
             token_threshold=token_threshold, allow_retry=False,
             input_fn=input_fn, output_fn=output_fn,
+            inline_payloads=inline_payloads,
+            allow_notebook_reselect=allow_notebook_reselect,
         )
 
     if selected == "inline":
@@ -654,6 +649,8 @@ def _settle_upload_failure(
             inline_base_characters=inline_base_characters,
             token_threshold=token_threshold,
             input_fn=input_fn, output_fn=output_fn,
+            inline_payloads=inline_payloads,
+            quota_text_paths=quota_text_paths,
         )
         if selected_inline:
             chosen = {Path(p).resolve() for p in selected_inline}
@@ -661,6 +658,9 @@ def _settle_upload_failure(
                 True, attached, [p for p in paths if p not in chosen], report,
                 "User authorized eligible source/TXT inline fallback.", selected_inline,
             )
+
+    if selected == "reselect":
+        return UploadDecision(False, attached, paths, report, "RESELECT_NOTEBOOK")
 
     if selected == "skip":
         # Explicitly permits sending a no-file prompt when every selected upload
@@ -684,6 +684,8 @@ def upload_and_confirm(
     provider=None,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
+    inline_payloads: dict[Path, str] | None = None,
+    allow_notebook_reselect: bool = False,
 ) -> UploadDecision:
     """Upload, verify per file, and invoke only the recovery decisions needed."""
     normalized = list(dict.fromkeys(Path(path).expanduser().resolve() for path in paths))
@@ -716,6 +718,8 @@ def upload_and_confirm(
         allow_retry=True,
         input_fn=input_fn,
         output_fn=output_fn,
+        inline_payloads={Path(p).resolve(): text for p, text in (inline_payloads or {}).items()},
+        allow_notebook_reselect=allow_notebook_reselect,
     )
 
 
@@ -768,6 +772,7 @@ def build_delivery_prompt(
     inline_paths: Sequence[str | Path] = (),
     omitted_paths: Sequence[str | Path] = (),
     report: UploadReport | None = None,
+    display_filenames: dict[Path, str] | None = None,
 ) -> str:
     """Rewrite reference markers and accurately describe delivered file context."""
     attached = list(dict.fromkeys(Path(path).expanduser().resolve() for path in attached_paths))
@@ -793,7 +798,8 @@ def build_delivery_prompt(
             else:
                 evidence = "verified in the provider UI"
             display_ref = reference_by_path.get(path, path.name)
-            attached_lines.append(f"- `{display_ref}` ({evidence}; filename: `{path.name}`)")
+            displayed = (display_filenames or {}).get(path, path.name)
+            attached_lines.append(f"- `{display_ref}` ({evidence}; filename: `{displayed}`)")
         sections.append(
             "FILES ATTACHED TO THIS CHAT\n"
             "============================\n"

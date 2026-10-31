@@ -24,6 +24,10 @@ _EMBEDDED_IMAGE_DATA_URI = re.compile(
 )
 
 
+class NotebookSelectionCancelled(ValueError):
+    """User explicitly cancelled notebook selection before sending a request."""
+
+
 class StructuredContextBuilder:
     """Prepare context for structured documents through registered format adapters.
 
@@ -167,6 +171,8 @@ class StructuredContextBuilder:
     ) -> set[int]:
         while True:
             answer = self._input(prompt).strip().lower()
+            if answer == "cancel_notebook":
+                raise NotebookSelectionCancelled("Notebook selection cancelled before submission.")
             if not answer:
                 return set(default)
             if answer == "all":

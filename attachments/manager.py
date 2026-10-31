@@ -54,7 +54,12 @@ class AttachmentManager:
             # attachments. EditValidator still enforces cell-aware notebook edits.
             kind = classify_file(path)
 
+            # Explicit .ipynb selections are prepared by NotebookPreparationService.
+            # The generic exclusion text predates that adapter; do not classify
+            # an explicitly selected notebook as UNSUPPORTED solely for its type.
             reason = exclusion_reason(path)
+            if kind == FileKind.NOTEBOOK and reason == "notebook files use the existing cell-aware context workflow":
+                reason = None
             if reason:
                 record.status = (
                     AttachmentStatus.BLOCKED

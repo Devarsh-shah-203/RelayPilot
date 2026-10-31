@@ -214,6 +214,17 @@ class BrowserAttachmentProvider:
                 record.message = "File does not exist or is not a regular file."
                 continue
             reason = exclusion_reason(path)
+            # NotebookPreparationService has already asked the user which cells
+            # and outputs are permitted, and hands this adapter either the
+            # original notebook (all cells + all outputs) or an explicitly
+            # filtered temporary notebook. The generic exclusion policy is
+            # intended to keep notebooks out of *bulk* discovery, not to block
+            # these explicit, prepared uploads at the provider boundary.
+            if (
+                classify_file(path) == FileKind.NOTEBOOK
+                and reason == "notebook files use the existing cell-aware context workflow"
+            ):
+                reason = None
             if reason:
                 record.status = (
                     AttachmentStatus.BLOCKED
@@ -355,15 +366,19 @@ class BrowserAttachmentProvider:
 
         extensions = cls._extensions(path)
         mime, _encoding = mimetypes.guess_type(path.name)
-        mime = mime.casefold() if mime else None
         kind = classify_file(path)
+        if kind == FileKind.NOTEBOOK and not mime:
+            # Python/OS MIME databases do not consistently recognize .ipynb.
+            # This is used only to match a provider's *advertised* MIME filter.
+            mime = "application/x-ipynb+json"
+        mime = mime.casefold() if mime else None
 
         for token in tokens:
             if token.startswith(".") and token in extensions:
                 return True
             if token == "application/octet-stream" and kind in {
                 FileKind.TEXT, FileKind.DOCUMENT, FileKind.IMAGE,
-                FileKind.SPREADSHEET, FileKind.ARCHIVE,
+                FileKind.SPREADSHEET, FileKind.ARCHIVE, FileKind.NOTEBOOK,
             }:
                 # A generic binary input is compatible with the supported families;
                 # per-file validation and the real provider response remain decisive.
@@ -532,14 +547,11 @@ class BrowserAttachmentProvider:
         candidates = [item for item in after.alerts if item not in before.alerts]
         for candidate in candidates:
             text = candidate.casefold()
-            limit_kind = classify_upload_limit(candidate)
             matched = next((term for term in _ERROR_TERMS if term in text), None)
-            # Recognize all of the strict limit phrases, not only the subset
-            # duplicated in _ERROR_TERMS. The candidate is already scoped to
-            # an active alert/toast, not unrelated browser history text.
-            if not matched and limit_kind == UploadLimitKind.UNKNOWN:
+            if not matched:
                 continue
-            matched = matched or "provider upload limit"
+
+            limit_kind = classify_upload_limit(candidate)
             if limit_kind in {
                 UploadLimitKind.BATCH_COUNT,
                 UploadLimitKind.FILE_SIZE,
@@ -572,11 +584,8 @@ class BrowserAttachmentProvider:
         because it did not change text. Otherwise filename evidence alone could
         incorrectly mark a failed or blocked upload as attached.
         """
-        def upload_warning(value: str) -> bool:
-            return any(term in value.casefold() for term in _ERROR_TERMS) or classify_upload_limit(value) != UploadLimitKind.UNKNOWN
-
-        previous = {item for item in before.alerts if upload_warning(item)}
-        current = {item for item in after.alerts if upload_warning(item)}
+        previous = {item for item in before.alerts if any(term in item.casefold() for term in _ERROR_TERMS)}
+        current = {item for item in after.alerts if any(term in item.casefold() for term in _ERROR_TERMS)}
         return bool(previous & current)
 
     @staticmethod

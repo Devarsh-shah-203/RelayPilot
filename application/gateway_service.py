@@ -7,6 +7,8 @@ thread. This module deliberately has no Textual or Playwright imports.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from threading import Event
 from typing import Callable
@@ -24,6 +26,9 @@ from files.context import FileContextBuilder
 from files.edit_prompt import build_edit_prompt
 from files.edit_workflow import EditWorkflow
 from files.structured_context import StructuredContextBuilder
+from files.notebook_delivery import NotebookPreparationService, NotebookSelectionCancelled
+from attachments.models import AttachmentRecord, UploadReport
+from attachments.policy import FileKind, estimate_tokens
 from memory.prompts import build_save_prompt
 from memory.saver import MemorySaver
 from application.command_registry import render_command_help
@@ -355,86 +360,245 @@ class GatewayService:
                 severity="warning",
             )
 
-        # Upload-first for normal requests and EDIT MODE alike. The existing
-        # parser, validator, diff and approval workflow remain authoritative.
-        attached_paths: list[Path] = []
-        inline_paths = list(attachment_plan.inline_paths)
-        upload_report = None
+        # Notebook selection is the one exception to blanket upload-first:
+        # selections fitting the budget are inlined; larger selections upload
+        # the original notebook if fully approved, else a filtered copy.
+        # Every temporary attachment is deleted after the request completes.
+        from application.contracts import EditProposalStarted
         if self.edit_mode:
-            from application.contracts import EditProposalStarted
             self.emit_event(EditProposalStarted(request_id=request_id))
 
-        if attachment_plan.uses_attachments:
-            if cancel_event.is_set():
-                return ServiceResult(state="CANCELLED")
-            on_state("PREPARING", "Uploading and verifying referenced files")
-            recovery_lines: list[str] = []
+        attached_paths: list[Path] = []
+        inline_paths: list[Path] = []
+        inline_contexts: list[dict] = []
+        upload_report = None
+        filename_overrides: dict[Path, str] = {}
 
-            def show_recovery_line(line: str) -> None:
-                recovery_lines.append(line)
-
-            def request_recovery_choice(question: str) -> str:
-                # Existing recovery emitted a list via print/toasts and opened a
-                # modal containing only "Choice:". Include the entire choice list
-                # in the modal so users can actually make an informed decision.
-                explanation = "\n".join(recovery_lines[-45:])
-                recovery_lines.clear()
-                return self.request_user_input(
-                    f"{explanation}\n\n{question}" if explanation else question
-                )
-
-            upload_decision = upload_and_confirm(
-                attachment_plan.attachment_paths,
-                self.chat.page,
-                fallback_candidates=attachment_plan.inline_fallback_candidates,
-                inline_base_characters=inline_fallback_base_characters(
-                    prompt, attachment_plan, memory_characters
-                ),
-                token_threshold=attachment_plan.token_threshold,
-                input_fn=request_recovery_choice,
-                output_fn=show_recovery_line,
-            )
-            upload_report = upload_decision.report
-            if upload_report is not None:
-                from application.contracts import AttachmentStatusChanged
-                for record in upload_report.records:
-                    self.emit_event(AttachmentStatusChanged(
-                        attachment_id=str(Path(record.path).resolve()),
-                        file_name=Path(record.path).name,
-                        status=record.status.value,
-                        message=record.message,
-                        request_id=request_id,
-                    ))
-            if not upload_decision.proceed:
-                self._notice(
-                    "The prompt was not sent because attachment recovery was cancelled "
-                    "or an uncertain upload could not safely be excluded. Inspect the "
-                    "browser attachment area before retrying.",
-                    title="Attachment request cancelled", severity="warning",
-                )
-                return ServiceResult(state="CANCELLED", submitted=False)
-            attached_paths = list(upload_decision.attached_paths)
-            inline_paths.extend(upload_decision.inline_paths)
-
-        delivered = {path.resolve() for path in attached_paths} | {path.resolve() for path in inline_paths}
-        omitted_paths = [path for path in attachment_plan.paths if path.resolve() not in delivered]
-        file_context = build_inline_context(self.file_context_builder, attachment_plan, inline_paths)
-        delivery_prompt = build_delivery_prompt(
-            prompt, attachment_plan,
-            attached_paths=attached_paths, inline_paths=inline_paths,
-            omitted_paths=omitted_paths, report=upload_report,
-        )
+        # Reserve room for the structured edit protocol before choosing inline
+        # notebook delivery. Without this, a small selection can appear to fit
+        # but overflow after EDIT_PROTOCOL is wrapped around the final prompt.
+        edit_prompt_reserve = 0
         if self.edit_mode:
-            final_prompt = build_edit_prompt(
-                delivery_prompt, file_context,
-                include_instructions=not self.edit_protocol_sent,
+            edit_prompt_reserve = max(
+                0,
+                len(build_edit_prompt(
+                    prompt, [], include_instructions=not self.edit_protocol_sent
+                )) - len(prompt),
             )
-        else:
-            final_prompt = self.context_builder.build(
-                delivery_prompt, include_memory=include_memory,
-                file_context=file_context,
+        notebook_count = sum(
+            1 for path in attachment_plan.paths if path.suffix.casefold() == '.ipynb'
+        )
+        notebook_manifest_reserve = notebook_count * 500
+
+        with TemporaryDirectory(prefix="relaypilot-notebook-") as temp_dir:
+            for selection_attempt in range(3):
+                # A quota-specific 'fewer cells' decision restarts notebook
+                # selection without submitting the original prompt.
+                attached_paths.clear()
+                inline_paths.clear()
+                inline_contexts.clear()
+                filename_overrides.clear()
+                selected_notebooks = {}
+                upload_paths = [p for p in attachment_plan.attachment_paths
+                                if p.suffix.casefold() != '.ipynb']
+                upload_to_original: dict[Path, Path] = {}
+                inline_fallback_payloads: dict[Path, str] = {}
+                notebook_preparer = NotebookPreparationService(
+                    self.file_context_builder.structured_context_builder
+                ) if any(p.suffix.casefold() == '.ipynb' for p in attachment_plan.paths) else None
+
+                try:
+                    for reference in attachment_plan.references:
+                        source = reference.path.resolve()
+                        if source.suffix.casefold() != '.ipynb' or source in selected_notebooks:
+                            continue
+                        assert notebook_preparer is not None
+                        selected = notebook_preparer.prepare(
+                            source, f"<{reference.raw_reference}>",
+                            inline_budget_chars=max(
+                                0, attachment_plan.token_threshold * 3
+                                - inline_fallback_base_characters(prompt, attachment_plan, memory_characters)
+                                - edit_prompt_reserve - notebook_manifest_reserve
+                                - sum(len(item['content']) for item in inline_contexts)
+                            ),
+                            temporary_directory=Path(temp_dir),
+                            notice=lambda text: self._notice(text, title="Notebook delivery"),
+                        )
+                        selected_notebooks[source] = selected
+                        if selected.upload_path is not None:
+                            upload = selected.upload_path.resolve()
+                            upload_paths.append(upload)
+                            upload_to_original[upload] = source
+                            filename_overrides[source] = upload.name
+                            if selected.fallback_text is not None:
+                                inline_fallback_payloads[upload] = selected.fallback_text
+                        else:
+                            inline_paths.append(source)
+                            inline_contexts.append({
+                                'reference': selected.reference,
+                                'path': str(source), 'content': selected.inline_text,
+                            })
+                except NotebookSelectionCancelled as error:
+                    self._notice(str(error), title="Notebook cancelled", severity="warning")
+                    return ServiceResult(state="CANCELLED", submitted=False)
+
+                if cancel_event.is_set():
+                    return ServiceResult(state="CANCELLED", submitted=False)
+
+                if upload_paths:
+                    on_state("PREPARING", "Uploading and verifying referenced files")
+                    recovery_lines: list[str] = []
+
+                    def show_recovery_line(line: str) -> None:
+                        recovery_lines.append(line)
+
+                    def request_recovery_choice(question: str) -> str:
+                        explanation = "\n".join(recovery_lines[-45:])
+                        recovery_lines.clear()
+                        return self.request_user_input(
+                            f"{explanation}\n\n{question}" if explanation else question
+                        )
+
+                    upload_decision = upload_and_confirm(
+                        upload_paths, self.chat.page,
+                        fallback_candidates=[
+                            path for path in attachment_plan.attachment_paths
+                            if path.suffix.casefold() != '.ipynb' and
+                            any(ref.path == path and ref.kind == FileKind.TEXT for ref in attachment_plan.references)
+                        ] + list(inline_fallback_payloads),
+                        inline_payloads=inline_fallback_payloads,
+                        allow_notebook_reselect=bool(selected_notebooks),
+                        inline_base_characters=(inline_fallback_base_characters(
+                            prompt, attachment_plan, memory_characters
+                        ) + edit_prompt_reserve + notebook_manifest_reserve
+                          + sum(len(item['content']) for item in inline_contexts)),
+                        token_threshold=attachment_plan.token_threshold,
+                        input_fn=request_recovery_choice,
+                        output_fn=show_recovery_line,
+                    )
+                    if upload_decision.reason == 'RESELECT_NOTEBOOK':
+                        if selection_attempt == 2:
+                            self._notice("Notebook selection retry limit reached; no request sent.",
+                                         title="Notebook", severity="warning")
+                            return ServiceResult(state="CANCELLED", submitted=False)
+                        continue
+
+                    upload_report = upload_decision.report
+                    if upload_report is not None:
+                        # The service and edit validator must always see the
+                        # authoritative source path, not a temporary notebook.
+                        converted = []
+                        for record in upload_report.records:
+                            source = upload_to_original.get(record.path.resolve(), record.path.resolve())
+                            converted.append(AttachmentRecord(
+                                path=source, status=record.status,
+                                attempts=record.attempts, message=record.message,
+                                verification_method=record.verification_method,
+                            ))
+                        upload_report = UploadReport(upload_report.provider_name, converted)
+                        from application.contracts import AttachmentStatusChanged
+                        for record in upload_report.records:
+                            self.emit_event(AttachmentStatusChanged(
+                                attachment_id=str(record.path.resolve()),
+                                file_name=record.path.name, status=record.status.value,
+                                message=record.message, request_id=request_id,
+                            ))
+                    if not upload_decision.proceed:
+                        self._notice(
+                            "The prompt was not sent. Resolve any staged attachment cards "
+                            "in Chrome before retrying.",
+                            title="Attachment request cancelled", severity="warning",
+                        )
+                        return ServiceResult(state="CANCELLED", submitted=False)
+                    attached_paths.extend(upload_to_original.get(Path(p).resolve(), Path(p).resolve())
+                                          for p in upload_decision.attached_paths)
+                    for path in upload_decision.inline_paths:
+                        upload = Path(path).resolve()
+                        original = upload_to_original.get(upload, upload)
+                        inline_paths.append(original)
+                        if upload in inline_fallback_payloads:
+                            ref = next(r.raw_reference for r in attachment_plan.references if r.path == original)
+                            inline_contexts.append({
+                                'reference': f'<{ref}>', 'path': str(original),
+                                'content': inline_fallback_payloads[upload],
+                            })
+
+                delivered = {p.resolve() for p in attached_paths + inline_paths}
+                omitted_paths = [p for p in attachment_plan.paths if p.resolve() not in delivered]
+                # Do not repeat notebook selection. Its approved exact payload
+                # was already prepared above, and is never taken from a staged
+                # temporary file after upload completion.
+                file_context = build_inline_context(
+                    self.file_context_builder, attachment_plan,
+                    [p for p in inline_paths if p.suffix.casefold() != '.ipynb']
+                ) + inline_contexts
+                delivery_prompt = build_delivery_prompt(
+                    prompt, attachment_plan,
+                    attached_paths=attached_paths, inline_paths=inline_paths,
+                    omitted_paths=omitted_paths, report=upload_report,
+                    display_filenames=filename_overrides,
+                )
+                if selected_notebooks:
+                    # Include a concise provider-neutral index manifest in
+                    # ordinary and edit prompts. Unselected source/output data
+                    # is never included. Full mappings are in filtered metadata.
+                    origin_lines = [
+                        'NOTEBOOK ORIGINAL CELL MAPPING',
+                        '==============================',
+                        'Notebook attachments are CONTEXT ONLY. For edits, target the original local notebook',
+                        'using original zero-based indices and IDs (not filtered attachment positions).',
+                    ]
+                    for source, prepared in selected_notebooks.items():
+                        indices = ','.join(map(str, prepared.selected_indices)) or 'none'
+                        outputs = ','.join(map(str, prepared.output_indices)) or 'none'
+                        reference = prepared.reference
+                        origin_lines.append(
+                            f'- {reference}: selected original indices [{indices}], approved outputs [{outputs}]; '
+                            f'original source SHA256 {prepared.source_sha256}; '
+                            f'provider file {filename_overrides.get(source, "inline context")}'
+                        )
+                    delivery_prompt += '\n\n' + '\n'.join(origin_lines)
+                    # A workspace notebook can be edited while the user is
+                    # selecting other files. Abort rather than sending stale
+                    # indices to the model.
+                    for source, prepared in selected_notebooks.items():
+                        if sha256(source.read_bytes()).hexdigest() != prepared.source_sha256:
+                            raise ValueError(f'Notebook {source.name} changed during selection; please reselect cells.')
+                if self.edit_mode:
+                    final_prompt = build_edit_prompt(
+                        delivery_prompt, file_context,
+                        include_instructions=not self.edit_protocol_sent,
+                    )
+                else:
+                    final_prompt = self.context_builder.build(
+                        delivery_prompt, include_memory=include_memory,
+                        file_context=file_context,
+                    )
+                if inline_contexts and estimate_tokens(len(final_prompt))[1] > attachment_plan.token_threshold:
+                    raise ValueError(
+                        'Selected notebook cells and the complete prompt exceed the inline budget. '
+                        'Choose fewer cells or outputs; no request was sent.'
+                    )
+                break
+
+            if cancel_event.is_set():
+                return ServiceResult(state="CANCELLED", submitted=False)
+
+            # All staging files must remain alive through send_prompt, because
+            # browser-side upload confirmation and submission may be asynchronous.
+            return self._send_prepared_request(
+                request_id, final_prompt, cancel_event, on_state,
+                on_response_start, on_response_change,
+                attached_paths, inline_paths, include_memory, save_result,
+                {source: delivery.source_sha256 for source, delivery in selected_notebooks.items()},
             )
 
+    def _send_prepared_request(
+        self, request_id, final_prompt, cancel_event, on_state,
+        on_response_start, on_response_change,
+        attached_paths, inline_paths, include_memory, save_result,
+        notebook_source_fingerprints=None,
+    ) -> ServiceResult:
         if cancel_event.is_set():
             return ServiceResult(state="CANCELLED", submitted=False)
 
@@ -473,6 +637,15 @@ class GatewayService:
                     # cannot be approved even if a model invents an insert_end
                     # operation that requires no MATCH. This is checked BEFORE
                     # the existing diff/approval writer is invoked.
+                    # Edited notebook sources must not have changed since the
+                    # selected cell mapping was generated for this request.
+                    from hashlib import sha256
+                    for source, fingerprint in (notebook_source_fingerprints or {}).items():
+                        if sha256(source.read_bytes()).hexdigest() != fingerprint:
+                            raise ValueError(
+                                f"Notebook {source.name} changed after cell selection; "
+                                "reselect cells and generate a new proposal before editing."
+                            )
                     proposed_edits = self.edit_workflow.parser.parse(result)
                     if not proposed_edits:
                         raise ValueError("The model did not provide a valid edit proposal.")
