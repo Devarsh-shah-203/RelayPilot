@@ -254,19 +254,25 @@ Inspect the proposed edit and its explanation. Approve it only if the change is 
 
 ### Use project memory
 
-The memory feature is controlled by commands:
+Memory is stored inside the RelayPilot installation. Its content lives in `RelayPilot/.ai/`, and its registry lives in `RelayPilot/.relaypilot/memory.json`, alongside the workspace configuration. This keeps each shipped or cloned RelayPilot copy self-contained.
 
 | Command | Purpose |
 | --- | --- |
-| `/memory use` | Include project memory in the next normal prompt only. |
-| `/memory on` | Enable memory mode. |
-| `/memory off` | Disable future memory injection. |
-| `/memory refresh` | Queue a fresh inclusion of the memory snapshot. |
-| `/save` | Ask the current conversation to identify durable project knowledge and save a validated proposal locally. |
+| `memory` | List registered Markdown memory filenames. |
+| `memory add [name]` | Create and register a file with optional multiline Markdown content; `.md` is added automatically. |
+| `memory renew` | Register new `.ai/*.md` files and report unsupported or missing entries. |
+| `memory refresh [question]` | Include current registered memory once in the next model request, or the supplied question. |
+| `/save` | Preserve the existing validated project-note extraction and append workflow. |
 
-Project memory is local by default and is not automatically attached to every prompt. Review the README for the complete command reference and the behavior of each memory mode.
+Slash-prefixed memory aliases also work. Refresh can be entered before or after `/edit`; local commands leave it pending, and confirmed model submission consumes it. For example:
 
-**Note:** `/commands` is planned but is not implemented in the current CLI yet.
+```text
+/edit 1
+memory refresh
+Create backend routes using <1/package.json>.
+```
+
+Select an existing destination workspace with `/edit 1` when requesting new files. An empty workspace is valid; input references still have to exist. Review and approve each proposed CREATE or MODIFY. Memory files share attachment count, size and inline fallback budgets with the explicitly referenced files. Use `/commands memory` or `/commands edit` for in-terminal help.
 
 ## 10. What to do next time you use RelayPilot
 
@@ -287,7 +293,6 @@ The recurring terminal commands are:
 python main.py
 ```
 
-The old print-based CLI remains available temporarily through `python main_legacy.py` as a rollback path.
 
 If `requirements.txt` changes after you update or pull the repository, activate `.venv` and rerun:
 
