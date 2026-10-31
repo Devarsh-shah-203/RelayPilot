@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+import re
 
 
 class UploadLimitKind(str, Enum):
@@ -31,8 +32,15 @@ _QUOTA_TERMS = (
     "you've reached your upload limit", "you have reached your upload limit",
     "you have used all available uploads", "you've used all available uploads",
     "upload quota", "daily upload limit", "no more uploads",
+    "you've reached the limit for file attachments",
+    "you have reached the limit for file attachments",
+    "you’ve reached the limit for file attachments",
+    "reached the limit for file attachments",
     "file uploads are currently unavailable", "uploads are temporarily unavailable",
     "you can upload more files after", "upload allowance has been exhausted",
+    # ChatGPT's attachment *menu* may show the quota instead of a banner.
+    # These phrases explicitly concern upload availability, not subscriptions in general.
+    "get plus for more uploads",
 )
 
 
@@ -46,5 +54,9 @@ def classify_upload_limit(message: str) -> UploadLimitKind:
     if any(term in text for term in _BATCH_TERMS):
         return UploadLimitKind.BATCH_COUNT
     if any(term in text for term in _QUOTA_TERMS):
+        return UploadLimitKind.PROVIDER_QUOTA
+    # Menu subheading such as "Or wait 10 hours to upload again".
+    # Must specify the upload operation; "wait 10 hours" alone is not enough.
+    if re.search(r"\bwait\s+(?:\d+\s+(?:minutes?|hours?|days?)\s*)+to\s+upload\s+again\b", text):
         return UploadLimitKind.PROVIDER_QUOTA
     return UploadLimitKind.UNKNOWN
