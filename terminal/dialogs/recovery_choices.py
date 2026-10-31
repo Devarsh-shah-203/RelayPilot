@@ -21,6 +21,18 @@ class RecoveryChoice:
     def is_retry(self) -> bool:
         return self.label.casefold().startswith("retry upload")
 
+    @property
+    def requires_cleanup(self) -> bool:
+        """Identify actions that may submit or restage unresolved cards.
+
+        Accept the current labels and earlier recovery-panel wording. The
+        picker and acknowledgment encoder must use this same classification.
+        """
+        return self.label.strip().casefold().startswith((
+            "retry upload", "append eligible", "send as prompt",
+            "skip the unresolved", "skip unresolved",
+        ))
+
 
 @dataclass(frozen=True)
 class RecoveryPrompt:
@@ -50,7 +62,10 @@ def parse_recovery_prompt(prompt: str) -> RecoveryPrompt | None:
     return RecoveryPrompt(
         explanation="\n".join(description).strip(),
         choices=tuple(choices),
-        has_uncertain_upload="UNKNOWN means a file may already be present" in prompt,
+        has_uncertain_upload=(
+            "UNKNOWN means a file may already be present" in prompt
+            or "UPLOAD QUOTA CLEANUP:" in prompt
+        ),
     )
 
 
@@ -63,9 +78,7 @@ def encode_recovery_choice(menu: RecoveryPrompt, choice_number: str, *, cleanup_
     selected = next((c for c in menu.choices if c.number == choice_number), None)
     if selected is None:
         raise ValueError("Unknown attachment recovery choice")
-    if menu.has_uncertain_upload and selected.label.casefold().startswith((
-        "retry upload", "append eligible", "skip the unresolved"
-    )):
+    if menu.has_uncertain_upload and selected.requires_cleanup:
         if not cleanup_checked:
             raise ValueError("Check Chrome and acknowledge that staged copies were cleared before continuing")
         prefix = CONFIRMED_RETRY_PREFIX if selected.is_retry else CONFIRMED_CLEANUP_PREFIX
