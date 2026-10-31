@@ -6,7 +6,15 @@ Return exactly one <AI_EDIT> block containing one or more <EDIT> blocks. Close e
 
 CRITICAL OUTPUT ENVELOPE FOR BROWSER CHAT: Wrap the ENTIRE <AI_EDIT> block inside one five-backtick `text` code fence (opening line: five backticks followed by text; closing line: five backticks alone). This protects all literal XML-like protocol tags and indentation when the browser renders Markdown. Keep the existing fenced source code inside each <CONTENT> section; do not flatten it. The outer five-backtick fence is presentation-only and is NOT part of the file content. Only output the fenced block, no explanation above or below.
 
+Approved file actions are CREATE and MODIFY. Existing replace/insert and notebook operations below are MODIFY actions.
+For a new file, use operation: create, an empty MATCH, and the complete new file CONTENT.
+CREATE is allowed only inside the explicitly selected target workspace shown in the request.
+Never infer a destination from input references. Never create a workspace or delete a file.
+CREATE must not overwrite an existing file. A missing referenced input is an error, not permission to create it.
+For a whole-file modification, operation: modify requires MATCH containing the complete current file.
 For ordinary text files, use these operations:
+- create (new file only, selected destination required)
+- modify (whole existing file, complete original MATCH required)
 - replace
 - insert_before
 - insert_after
@@ -147,7 +155,7 @@ Notebook rules:
 - Make only the requested changes. If the relevant cell was not included in the provided context, ask for it rather than guessing.
 
 General rules for all operations:
-- file must be a provided workspace-relative file reference.
+- For MODIFY, file must be a provided workspace-relative file reference. For CREATE, file must be inside the explicitly selected target workspace; use its ID followed by the new relative path.
 - For replace, insert_before, and insert_after, MATCH must identify exactly one current location.
 - MATCH must be empty for insert_start, insert_end, and insert_cell. For edit_cell, MATCH may be empty only when the target cell's existing source is empty.
 - Put CONTENT inside one complete Markdown fence; the gateway removes the outer fence before applying the edit. Match the opening and closing fence lengths exactly.
@@ -172,7 +180,7 @@ CURRENT USER EDIT REQUEST:
 
 # Later edits reuse the established contract without resending the complete
 # instructions; notebook operations remain explicitly described.
-EDIT_CONTINUATION = r"""Continue using the established RelayPilot edit contract. Return exactly one <AI_EDIT> block containing correctly closed <EDIT>, <MATCH>, <CONTENT>, and <REASON> tags. Enclose the COMPLETE block inside one five-backtick `text` Markdown fence. Preserve the inner code fence in <CONTENT>, matching opening and closing fence length. The browser must display literal tags and source indentation, never flatten them into prose. Return no text outside the outer fence. Use the allowed operation that matches the target: standard text operations for ordinary text files; edit_cell or insert_cell for .ipynb files only. Never edit notebook JSON as raw text.
+EDIT_CONTINUATION = r"""Continue using the established RelayPilot edit contract. Return exactly one <AI_EDIT> block containing correctly closed <EDIT>, <MATCH>, <CONTENT>, and <REASON> tags. Enclose the COMPLETE block inside one five-backtick `text` Markdown fence. Preserve the inner code fence in <CONTENT>, matching opening and closing fence length. The browser must display literal tags and source indentation, never flatten them into prose. Return no text outside the outer fence. Use operation:create with empty MATCH and complete CONTENT only for a new file inside the explicitly selected destination workspace; never infer that destination from input references, overwrite an existing CREATE target, create a workspace or delete files. operation:modify replaces a whole existing ordinary text file and requires its complete original MATCH. Existing standard text operations for ordinary text files; edit_cell or insert_cell for .ipynb files only. Never edit notebook JSON as raw text.
 
 Notebook contract: indices are zero-based against the original notebook. edit_cell requires cell_index and MATCH containing the target cell's complete current source. insert_cell requires cell_type=code|markdown, position=before|after|start|end, and cell_index only for before/after; its MATCH must be empty. CONTENT is source wrapped in one complete Markdown fence; use a four-backtick outer fence when Markdown source includes triple-backtick code fences. Preserve unrelated cells, metadata, outputs, and execution counts. New code cells start with empty outputs and execution_count=null.
 
@@ -195,8 +203,17 @@ CURRENT USER EDIT REQUEST:
 """
 
 
-def build_edit_prompt(user_prompt, file_context, *, include_instructions=True):
+def build_edit_prompt(user_prompt, file_context, *, include_instructions=True, target_workspace=None):
     """Build the first full edit prompt or a compact continuation prompt."""
+    if target_workspace is not None:
+        if isinstance(target_workspace, dict):
+            workspace_id = target_workspace["id"]
+            workspace_path = target_workspace["path"]
+            existing = target_workspace.get("existing_files", "Only explicitly provided files are available as source context.")
+            target_text = f"SELECTED CREATE DESTINATION\nWorkspace ID: {workspace_id}\nCanonical root: {workspace_path}\nExisting files: {existing}"
+        else:
+            target_text = str(target_workspace)
+        user_prompt = target_text + "\n\n" + user_prompt
     formatted_files = []
     for file in file_context:
         formatted_files.append(
