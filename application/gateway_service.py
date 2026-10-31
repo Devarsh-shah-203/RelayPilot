@@ -31,6 +31,7 @@ from attachments.models import AttachmentRecord, UploadReport
 from attachments.policy import FileKind, estimate_tokens
 from memory.prompts import build_save_prompt
 from memory.saver import MemorySaver
+from memory.registry import MemoryRegistry
 from application.command_registry import render_command_help
 from workspace.manager import WorkspaceManager
 
@@ -55,14 +56,19 @@ class GatewayService:
         emit_event: Callable[[object], None],
         request_user_input: Callable[[str], str],
         request_edit_approval: Callable[[str, str, str], bool],
+        project_dir: str | Path | None = None,
     ) -> None:
         self.chat = chat
         self.emit_event = emit_event
         self.request_user_input = request_user_input
         self.request_edit_approval = request_edit_approval
 
+        # Memory and RelayPilot metadata live inside the installed clone so a
+        # shipped copy remains self-contained regardless of its parent folder.
+        self.project_root = Path(project_dir).resolve() if project_dir is not None else Path(__file__).resolve().parents[1]
+        self.memory_registry = MemoryRegistry(self.project_root)
         self.workspace = WorkspaceManager()
-        self.context_builder = ContextBuilder()
+        self.context_builder = ContextBuilder(project_dir=self.project_root)
         # Notebook cell selection is interactive. Route its prompt and summary
         # through the runtime/UI bridge instead of calling input()/print() while
         # Textual owns the terminal.
@@ -75,8 +81,9 @@ class GatewayService:
             self.workspace,
             structured_context_builder=structured_context,
         )
-        self.memory_session = MemoryContextSession()
-        self.memory_saver = MemorySaver()
+        self.memory_session = MemoryContextSession(self.project_root)
+        self.memory_saver = MemorySaver(project_dir=self.project_root)
+        self.target_workspace_id: int | None = None
         self.edit_workflow = EditWorkflow(
             workspace_manager=self.workspace,
             approval_function=self.request_edit_approval,
@@ -156,8 +163,10 @@ class GatewayService:
         on_response_start: Callable[[], None],
         on_response_change: Callable[[object], None],
     ) -> ServiceResult:
-        """Execute existing commands; inline memory commands retain old semantics."""
+        """Route local commands and explicit one-shot model requests."""
         prompt = command_text.strip()
+        if prompt and prompt.split(None, 1)[0].casefold() == "memory":
+            prompt = "/" + prompt
         command = prompt.casefold()
 
         if command == "/commands" or command.startswith("/commands "):
@@ -172,7 +181,20 @@ class GatewayService:
             self.emit_event(HelpRequested(text="\n".join(lines)))
             return ServiceResult(message="Command reference opened.")
 
-        if command == "/edit":
+        if command == "/edit" or command.startswith("/edit "):
+            selected = prompt[len("/edit"):].strip()
+            if selected:
+                if not selected.isdigit():
+                    raise ValueError("Usage: /edit [existing_workspace_id]")
+                workspace_id = int(selected)
+                entries = self.workspace.list_directories()
+                destination = next((entry for entry in entries if entry["id"] == workspace_id), None)
+                if destination is None or not Path(destination["path"]).is_dir():
+                    raise ValueError("Select an existing registered workspace for file creation.")
+                self.target_workspace_id = workspace_id
+                self.edit_workflow.target_workspace_id = workspace_id
+                self.edit_protocol_sent = False
+                self._notice(f"New files may be proposed in workspace [{workspace_id}] {destination['path']}. Every file requires approval.", title="Edit destination")
             if self.edit_mode:
                 message = "Already in EDIT MODE."
             else:
@@ -191,6 +213,8 @@ class GatewayService:
             if self.edit_mode:
                 self.edit_mode = False
                 self.edit_protocol_sent = False
+                self.target_workspace_id = None
+                self.edit_workflow.target_workspace_id = None
                 message = "EDIT MODE disabled."
             else:
                 message = "Not currently in EDIT MODE."
@@ -241,46 +265,47 @@ class GatewayService:
             self._publish_workspace_status()
             return ServiceResult(message=message)
 
-        if command == "/memory off":
-            self.memory_session.disable()
-            self._publish_memory_status()
-            message = "Project-memory injection disabled for future requests."
+        if command == "/memory":
+            entries = self.memory_registry.list_entries()
+            message = "Registered project memory:\n" + "\n".join(
+                f"- {entry['path']}" + (" (disabled)" if not entry['enabled'] else "")
+                for entry in entries
+            ) if entries else "No registered memory files. Use memory add or memory renew."
             self._notice(message, title="Memory")
             return ServiceResult(message=message)
 
-        if command == "/memory use" or command.startswith("/memory use "):
-            self.memory_session.use_once()
-            self._publish_memory_status()
-            if command == "/memory use":
-                message = "Project memory is queued for the next normal prompt only."
-                self._notice(message, title="Memory")
-                return ServiceResult(message=message)
-            prompt = prompt[len("/memory use"):].strip()
-            return self._run_prompt(
-                request_id, prompt, cancel_event=cancel_event,
-                on_state=on_state, on_response_start=on_response_start,
-                on_response_change=on_response_change,
-            )
+        if command == "/memory renew":
+            result = self.memory_registry.renew()
+            lines = [f"Registered {len(result.added)} new Markdown memory file(s)."]
+            lines.extend(f"- {name}" for name in result.added)
+            lines.extend(f"Warning: {warning}" for warning in result.warnings)
+            lines.extend(f"Missing registered memory: {name}" for name in result.missing)
+            message = "\n".join(lines)
+            self._notice(message, title="Memory")
+            return ServiceResult(message=message)
 
-        if command == "/memory on" or command.startswith("/memory on "):
-            self.memory_session.enable()
-            self._publish_memory_status()
-            if command == "/memory on":
-                message = "Project memory enabled. The current snapshot will be loaded when needed."
-                self._notice(message, title="Memory")
-                return ServiceResult(message=message)
-            prompt = prompt[len("/memory on"):].strip()
-            return self._run_prompt(
-                request_id, prompt, cancel_event=cancel_event,
-                on_state=on_state, on_response_start=on_response_start,
-                on_response_change=on_response_change,
-            )
+        if command == "/memory add" or command.startswith("/memory add "):
+            name = prompt[len("/memory add"):].strip().strip('"')
+            if not name:
+                name = self.request_user_input(
+                    "MEMORY FILENAME\nName the new memory file (for example architecture). "
+                    "RelayPilot adds .md automatically."
+                ).strip()
+            if name == "CANCEL_MEMORY":
+                return ServiceResult(message="Memory creation cancelled.")
+            content = self.request_user_input("MEMORY INITIAL CONTENT\nOptional Markdown content. Leave blank to create an empty file, then Continue.")
+            if content == "CANCEL_MEMORY" or cancel_event.is_set():
+                return ServiceResult(message="Memory creation cancelled.")
+            created = self.memory_registry.add(name, content)
+            message = f"Created and registered .ai/{created.name}."
+            self._notice(message, title="Memory")
+            return ServiceResult(message=message)
 
         if command == "/memory refresh" or command.startswith("/memory refresh "):
             self.memory_session.refresh()
             self._publish_memory_status()
             if command == "/memory refresh":
-                message = "A fresh project-memory snapshot is queued for the next normal prompt."
+                message = "Project memory is queued for the next model request only, including /edit."
                 self._notice(message, title="Memory")
                 return ServiceResult(message=message)
             prompt = prompt[len("/memory refresh"):].strip()
@@ -289,6 +314,9 @@ class GatewayService:
                 on_state=on_state, on_response_start=on_response_start,
                 on_response_change=on_response_change,
             )
+
+        if command.startswith("/memory "):
+            raise ValueError("Use memory, memory refresh, memory add, or memory renew. Persistent memory on/use/off commands are retired.")
 
         if command == "/save":
             return self._run_prompt(
@@ -308,6 +336,19 @@ class GatewayService:
             on_state=on_state, on_response_start=on_response_start,
             on_response_change=on_response_change,
         )
+
+    def _target_workspace_context(self):
+        workspace_id = getattr(self, "target_workspace_id", None)
+        if workspace_id is None:
+            return "No CREATE destination has been selected. Only modify explicitly delivered existing files."
+        entry = next((item for item in self.workspace.list_directories() if item["id"] == workspace_id), None)
+        if entry is None:
+            raise ValueError("The selected CREATE workspace was removed; select it again with /edit <id>.")
+        root = Path(entry["path"])
+        if root.is_symlink() or (hasattr(root, "is_junction") and root.is_junction()) or not root.is_dir():
+            raise ValueError("The selected CREATE workspace is unavailable or redirected.")
+        existing = "none" if next(root.iterdir(), None) is None else "present; use only explicitly delivered files as source context"
+        return {"id": workspace_id, "path": str(root.resolve()), "existing_files": existing}
 
     def _run_prompt(
         self,
@@ -335,30 +376,50 @@ class GatewayService:
             )
 
         on_state("PREPARING", "Preparing prompt and project context")
-        include_memory = not self.edit_mode and self.memory_session.should_include_memory()
+        session = getattr(self, "memory_session", None)
+        include_memory = session is not None and session.should_include_memory()
+        memory_documents = self.memory_registry.load_current() if include_memory else []
+        memory_by_source = {document.path.resolve(): document for document in memory_documents}
+        # Memory uploads do not occupy inline space unless recovery selects them.
+        # Reserve the manifest labels in both notebook and fallback calculations.
         memory_characters = 0
-        if include_memory:
-            try:
-                memory_values = self.context_builder.memory.read_all()
-                memory_characters = sum(
-                    len(value) for value in memory_values.values()
-                    if isinstance(value, str) and value.strip()
-                )
-            except Exception:
-                memory_characters = 0
+        memory_manifest_reserve = sum(500 + 3 * len(doc.relative_path) for doc in memory_documents)
+        target_workspace = self._target_workspace_context() if self.edit_mode else None
 
         attachment_plan = plan_referenced_files(
             prompt,
             self.workspace,
             memory_characters=memory_characters,
             edit_mode=self.edit_mode,
+            trusted_memory_paths=tuple(memory_by_source),
         )
+        if attachment_plan.preflight_issues:
+            self._notice("\n".join(attachment_plan.preflight_issues), title="Workspace files", severity="warning")
+        if attachment_plan.excluded_references:
+            self._notice(
+                "Excluded from selection:\n" + "\n".join(
+                    f"- {item.reference}: {item.reason}" for item in attachment_plan.excluded_references
+                ), title="Workspace files", severity="warning",
+            )
         if attachment_plan.skipped_count:
             self._notice(
                 f"Bulk selection skipped {attachment_plan.skipped_count} generated, sensitive, unsupported, binary, or notebook file(s).",
                 title="Workspace files",
                 severity="warning",
             )
+
+        selected_labels = {}
+        for reference in attachment_plan.references:
+            selected_labels.setdefault(reference.path.resolve(), f"<{reference.raw_reference}>")
+        for source, document in memory_by_source.items():
+            label = document.relative_path
+            if source in selected_labels:
+                label += " (also " + selected_labels[source] + ")"
+            selected_labels[source] = label
+        if selected_labels:
+            self._notice("Selected context files:\n" + "\n".join(
+                f"- {label}" for label in selected_labels.values()
+            ), title="Workspace files")
 
         # Notebook selection is the one exception to blanket upload-first:
         # selections fitting the budget are inlined; larger selections upload
@@ -382,7 +443,8 @@ class GatewayService:
             edit_prompt_reserve = max(
                 0,
                 len(build_edit_prompt(
-                    prompt, [], include_instructions=not self.edit_protocol_sent
+                    prompt, [], include_instructions=not self.edit_protocol_sent,
+                    target_workspace=target_workspace,
                 )) - len(prompt),
             )
         notebook_count = sum(
@@ -390,7 +452,44 @@ class GatewayService:
         )
         notebook_manifest_reserve = notebook_count * 500
 
-        with TemporaryDirectory(prefix="relaypilot-notebook-") as temp_dir:
+        # Reject a request whose known attachment labels and instructions
+        # already cannot fit before spending provider upload capacity. Final
+        # serialized fallback content is checked again immediately before send.
+        memory_budget_lines = ["PROJECT MEMORY DELIVERY", "======================="]
+        for number, document in enumerate(memory_documents, 1):
+            staged_name = f"memory-{number:03d}-{document.path.name}"
+            memory_budget_lines.append(
+                f"- {document.relative_path}: planned attachment: {staged_name}"
+            )
+        budget_prompt = prompt
+        if memory_documents:
+            budget_prompt += "\n\n" + "\n".join(memory_budget_lines)
+        if self.edit_mode:
+            budget_prompt = build_edit_prompt(
+                budget_prompt, [], include_instructions=not self.edit_protocol_sent,
+                target_workspace=target_workspace,
+            )
+        if estimate_tokens(len(budget_prompt))[1] > attachment_plan.token_threshold:
+            inventory = "\n".join(
+                f"- {label}: not delivered; complete prompt metadata exceeds inline budget"
+                for label in selected_labels.values()
+            )
+            raise ValueError(
+                "Request preflight: the prompt, memory manifest, and edit instructions "
+                "exceed the inline budget. No files were uploaded and no request was sent.\n"
+                + inventory
+            )
+
+        with TemporaryDirectory(prefix="relaypilot-context-") as temp_dir:
+            # Validated .ai sources are snapshotted rather than weakening the
+            # browser provider's exclusion of arbitrary .ai directories.
+            memory_uploads: dict[Path, Path] = {}
+            memory_payloads: dict[Path, str] = {}
+            for number, document in enumerate(memory_documents, 1):
+                staged = Path(temp_dir) / f"memory-{number:03d}-{document.path.name}"
+                staged.write_bytes(document.content.encode("utf-8"))
+                memory_uploads[staged.resolve()] = document.path.resolve()
+                memory_payloads[staged.resolve()] = document.content
             for selection_attempt in range(3):
                 # A quota-specific 'fewer cells' decision restarts notebook
                 # selection without submitting the original prompt.
@@ -400,9 +499,11 @@ class GatewayService:
                 filename_overrides.clear()
                 selected_notebooks = {}
                 upload_paths = [p for p in attachment_plan.attachment_paths
-                                if p.suffix.casefold() != '.ipynb']
-                upload_to_original: dict[Path, Path] = {}
-                inline_fallback_payloads: dict[Path, str] = {}
+                                if p.suffix.casefold() != '.ipynb' and p.resolve() not in memory_by_source]
+                upload_paths.extend(memory_uploads)
+                upload_to_original: dict[Path, Path] = dict(memory_uploads)
+                inline_fallback_payloads: dict[Path, str] = dict(memory_payloads)
+                filename_overrides.update({source: staged.name for staged, source in memory_uploads.items()})
                 notebook_preparer = NotebookPreparationService(
                     self.file_context_builder.structured_context_builder
                 ) if any(p.suffix.casefold() == '.ipynb' for p in attachment_plan.paths) else None
@@ -418,7 +519,7 @@ class GatewayService:
                             inline_budget_chars=max(
                                 0, attachment_plan.token_threshold * 3
                                 - inline_fallback_base_characters(prompt, attachment_plan, memory_characters)
-                                - edit_prompt_reserve - notebook_manifest_reserve
+                                - edit_prompt_reserve - notebook_manifest_reserve - memory_manifest_reserve
                                 - sum(len(item['content']) for item in inline_contexts)
                             ),
                             temporary_directory=Path(temp_dir),
@@ -453,7 +554,7 @@ class GatewayService:
                         recovery_lines.append(line)
 
                     def request_recovery_choice(question: str) -> str:
-                        explanation = "\n".join(recovery_lines[-45:])
+                        explanation = "\n".join(recovery_lines)
                         recovery_lines.clear()
                         return self.request_user_input(
                             f"{explanation}\n\n{question}" if explanation else question
@@ -463,14 +564,14 @@ class GatewayService:
                         upload_paths, self.chat.page,
                         fallback_candidates=[
                             path for path in attachment_plan.attachment_paths
-                            if path.suffix.casefold() != '.ipynb' and
+                            if path.suffix.casefold() != '.ipynb' and path.resolve() not in memory_by_source and
                             any(ref.path == path and ref.kind == FileKind.TEXT for ref in attachment_plan.references)
                         ] + list(inline_fallback_payloads),
                         inline_payloads=inline_fallback_payloads,
                         allow_notebook_reselect=bool(selected_notebooks),
                         inline_base_characters=(inline_fallback_base_characters(
                             prompt, attachment_plan, memory_characters
-                        ) + edit_prompt_reserve + notebook_manifest_reserve
+                        ) + edit_prompt_reserve + notebook_manifest_reserve + memory_manifest_reserve
                           + sum(len(item['content']) for item in inline_contexts)),
                         token_threshold=attachment_plan.token_threshold,
                         input_fn=request_recovery_choice,
@@ -517,9 +618,13 @@ class GatewayService:
                         original = upload_to_original.get(upload, upload)
                         inline_paths.append(original)
                         if upload in inline_fallback_payloads:
-                            ref = next(r.raw_reference for r in attachment_plan.references if r.path == original)
+                            if original in memory_by_source:
+                                ref = memory_by_source[original].relative_path
+                            else:
+                                ref = next(r.raw_reference for r in attachment_plan.references if r.path == original)
+                                ref = f'<{ref}>'
                             inline_contexts.append({
-                                'reference': f'<{ref}>', 'path': str(original),
+                                'reference': ref, 'path': str(original),
                                 'content': inline_fallback_payloads[upload],
                             })
 
@@ -530,14 +635,49 @@ class GatewayService:
                 # temporary file after upload completion.
                 file_context = build_inline_context(
                     self.file_context_builder, attachment_plan,
-                    [p for p in inline_paths if p.suffix.casefold() != '.ipynb']
+                    [p for p in inline_paths if p.suffix.casefold() != '.ipynb' and p.resolve() not in memory_by_source]
                 ) + inline_contexts
+                if selected_labels:
+                    records = {record.path.resolve(): record for record in upload_report.records} if upload_report else {}
+                    outcomes = []
+                    for source, label in selected_labels.items():
+                        if source in inline_paths:
+                            state_label = "INLINE - complete content included"
+                        elif source in attached_paths:
+                            record = records.get(source)
+                            state_label = "ATTACHED - verified" if record and record.status.value == "ATTACHED" else "ATTACHED - verification evidence unavailable"
+                        else:
+                            record = records.get(source)
+                            reason = record.message if record else "not selected for delivery"
+                            state_label = "NOT DELIVERED - " + reason
+                        outcomes.append(f"- {label}: {state_label}")
+                    self._notice("Context delivery:\n" + "\n".join(outcomes), title="Workspace files")
                 delivery_prompt = build_delivery_prompt(
                     prompt, attachment_plan,
-                    attached_paths=attached_paths, inline_paths=inline_paths,
+                    attached_paths=[p for p in attached_paths if p in attachment_plan.paths],
+                    inline_paths=[p for p in inline_paths if p in attachment_plan.paths],
                     omitted_paths=omitted_paths, report=upload_report,
                     display_filenames=filename_overrides,
                 )
+                if include_memory:
+                    records = {record.path.resolve(): record for record in upload_report.records} if upload_report else {}
+                    memory_lines = ["PROJECT MEMORY DELIVERY", "======================="]
+                    if not memory_documents:
+                        memory_lines.append("No memory files are registered. No project memory was supplied.")
+                    for source, document in memory_by_source.items():
+                        if source in inline_paths:
+                            disposition = "complete contents included inline below"
+                        elif source in attached_paths:
+                            record = records.get(source)
+                            verified = record is not None and record.status.value == "ATTACHED"
+                            evidence = "verified provider attachment" if verified else "attachment reported without verification evidence"
+                            disposition = f"{evidence}: {filename_overrides[source]}"
+                        else:
+                            record = records.get(source)
+                            reason = record.message if record else "not selected for delivery"
+                            disposition = f"NOT DELIVERED: {reason}"
+                        memory_lines.append(f"- {document.relative_path}: {disposition}")
+                    delivery_prompt += "\n\n" + "\n".join(memory_lines)
                 if selected_notebooks:
                     # Include a concise provider-neutral index manifest in
                     # ordinary and edit prompts. Unselected source/output data
@@ -568,16 +708,18 @@ class GatewayService:
                     final_prompt = build_edit_prompt(
                         delivery_prompt, file_context,
                         include_instructions=not self.edit_protocol_sent,
+                        target_workspace=target_workspace,
                     )
                 else:
                     final_prompt = self.context_builder.build(
-                        delivery_prompt, include_memory=include_memory,
+                        delivery_prompt, include_memory=False,
                         file_context=file_context,
                     )
-                if inline_contexts and estimate_tokens(len(final_prompt))[1] > attachment_plan.token_threshold:
+                if estimate_tokens(len(final_prompt))[1] > attachment_plan.token_threshold:
                     raise ValueError(
-                        'Selected notebook cells and the complete prompt exceed the inline budget. '
-                        'Choose fewer cells or outputs; no request was sent.'
+                        'The complete prompt, memory, file context, and edit instructions exceed the inline budget. '
+                        'No context was truncated and no request was sent. Reduce the selection; '
+                        'clear staged attachment cards in Chrome before retrying.'
                     )
                 break
 
@@ -589,7 +731,8 @@ class GatewayService:
             return self._send_prepared_request(
                 request_id, final_prompt, cancel_event, on_state,
                 on_response_start, on_response_change,
-                attached_paths, inline_paths, include_memory, save_result,
+                [p for p in attached_paths if p in attachment_plan.paths],
+                [p for p in inline_paths if p in attachment_plan.paths], include_memory, save_result,
                 {source: delivery.source_sha256 for source, delivery in selected_notebooks.items()},
             )
 
@@ -606,8 +749,13 @@ class GatewayService:
 
         def state_callback(state: str, message: str | None = None) -> None:
             nonlocal submitted
-            if state == "SUBMITTED":
+            if state == "SUBMITTED" and not submitted:
                 submitted = True
+                if include_memory:
+                    self.memory_session.mark_memory_sent()
+                    self._publish_memory_status()
+                if self.edit_mode:
+                    self.edit_protocol_sent = True
             on_state(state, message)
 
         state, result = self.chat.send_prompt(
@@ -617,13 +765,6 @@ class GatewayService:
             on_response_start=on_response_start,
             on_response_change=on_response_change,
         )
-
-        if submitted:
-            if include_memory:
-                self.memory_session.mark_memory_sent()
-                self._publish_memory_status()
-            if self.edit_mode:
-                self.edit_protocol_sent = True
 
         if state == "COMPLETED":
             if save_result:
@@ -651,6 +792,10 @@ class GatewayService:
                         raise ValueError("The model did not provide a valid edit proposal.")
                     delivered_files = {path.resolve() for path in attached_paths + inline_paths}
                     for edit in proposed_edits:
+                        if edit.operation == "create":
+                            # The workflow validates against the separately
+                            # user-selected registered destination, never refs.
+                            continue
                         target = self.workspace.resolve_path(edit.file).resolve()
                         if target not in delivered_files:
                             raise ValueError(
@@ -659,12 +804,20 @@ class GatewayService:
                             )
                     # Existing parser/validator/diff/approval writer remains the
                     # authoritative path for accepted proposals.
+                    self.edit_workflow.target_workspace_id = getattr(self, "target_workspace_id", None)
                     edit_results = self.edit_workflow.run(result)
+                    summaries = []
+                    for item in edit_results:
+                        summaries.append(f"{item['file']}: {item['status']}")
+                        if item.get("message"):
+                            summaries.append(f"  Error for {item['file']}: {item['message']}")
+                    text = "\n".join(summaries) if summaries else "No edit operations were applied."
+                    self.emit_event(EditReviewResult(
+                        request_id=request_id,
+                        successful=all(item['status'] != 'FAILED' for item in edit_results), message=text,
+                    ))
                     if cancel_event.is_set():
                         return ServiceResult(state="CANCELLED", response=result, submitted=True)
-                    summaries = [f"{item['file']}: {item['status']}" for item in edit_results]
-                    text = "\n".join(summaries) if summaries else "No edit operations were applied."
-                    self.emit_event(EditReviewResult(request_id=request_id, successful=True, message=text))
                 except Exception as error:
                     # A transient toast used to swallow these failures. Keep the
                     # precise failure visible in the conversation instead.
