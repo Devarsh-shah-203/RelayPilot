@@ -11,67 +11,106 @@ from .provider import AttachmentProvider
 
 
 class AttachmentManager:
-    """Orchestrate attachments without knowing provider-specific browser details.
+    """Orchestrate uploads without knowing provider-specific browser details.
 
-    Successes are silent. This class returns a structured report so the caller can
-    decide whether to continue, ask the user, or cancel. Only explicitly FAILED
-    files are retried once; UNKNOWN results are never blindly retried.
+    No upload failures are retried without permission, including confirmed
+    failures. UNKNOWN statuses require extra care because a file may be staged.
+    Known account/session quota warnings are checked before any file selection.
     """
 
     def __init__(self, provider: AttachmentProvider, *, max_retries: int = 1) -> None:
         if max_retries < 0:
             raise ValueError("max_retries cannot be negative")
         self.provider = provider
-        self.max_retries = min(max_retries, 1)  # safety policy: at most one retry
+        self.max_retries = min(max_retries, 1)
 
-    def upload(self, paths: Sequence[str | Path]) -> UploadReport:
-        normalized: list[Path] = []
-        seen: set[Path] = set()
+    def upload(
+        self,
+        paths: Sequence[str | Path],
+        *,
+        retry_failed: bool = False,
+        preflight: bool = True,
+    ) -> UploadReport:
         records: dict[Path, AttachmentRecord] = {}
+        normalized: list[Path] = []
+        valid_paths: list[Path] = []
+        seen: set[Path] = set()
 
         for raw_path in paths:
             path = Path(raw_path).expanduser().resolve()
             if path in seen:
                 continue
             seen.add(path)
+            normalized.append(path)
             record = AttachmentRecord(path=path)
             records[path] = record
 
             if not path.exists() or not path.is_file():
                 record.status = AttachmentStatus.FAILED
-                record.message = "file does not exist or is not a regular file"
+                record.message = "File does not exist or is not a regular file."
                 continue
+
+            # Explicit notebook references may be offered to the provider as
+            # attachments. EditValidator still enforces cell-aware notebook edits.
+            kind = classify_file(path)
 
             reason = exclusion_reason(path)
             if reason:
-                # Documents/images and text are allowed; special-case excluded
-                # unknown/private formats as policy blocks rather than upload errors.
-                record.status = AttachmentStatus.BLOCKED if "excluded" in reason or "secret" in reason or "credential" in reason or "environment" in reason or "private-key" in reason else AttachmentStatus.UNSUPPORTED
+                record.status = (
+                    AttachmentStatus.BLOCKED
+                    if any(token in reason.casefold() for token in (
+                        "excluded", "secret", "credential", "environment", "private-key",
+                    ))
+                    else AttachmentStatus.UNSUPPORTED
+                )
                 record.message = reason
                 continue
 
-            if classify_file(path) == FileKind.ARCHIVE:
+            if kind == FileKind.UNKNOWN:
                 record.status = AttachmentStatus.UNSUPPORTED
-                record.message = "archive uploads are opt-in and disabled by default"
+                record.message = "File type is not supported by the default attachment policy."
                 continue
-            normalized.append(path)
 
-        if normalized:
-            self._run_provider_upload(normalized, records)
+            valid_paths.append(path)
+
+        if not valid_paths:
+            return UploadReport(self.provider.name, list(records.values()))
+
+        # Providers can only preflight limits that are explicitly visible in the
+        # active UI. An invisible account quota cannot be reliably queried through
+        # browser automation, so a clear preflight is not proof of available quota.
+        if preflight:
+            checker = getattr(self.provider, "preflight_upload_limit", None)
+            if callable(checker):
+                try:
+                    warning = checker(valid_paths)
+                except Exception:
+                    # A failed preflight probe must not falsely claim quota or block
+                    # the upload. Normal verification remains mandatory afterwards.
+                    warning = None
+                if warning:
+                    message = f"Preflight detected a provider upload quota warning: {str(warning).strip()}"
+                    for path in valid_paths:
+                        records[path].status = AttachmentStatus.LIMIT_EXCEEDED
+                        records[path].message = message
+                    return UploadReport(self.provider.name, list(records.values()))
+
+        self._run_provider_upload(valid_paths, records)
 
         retry_paths = [
-            path for path in normalized
-            if records[path].status == AttachmentStatus.FAILED
+            path for path in valid_paths
+            if retry_failed
+            and records[path].status == AttachmentStatus.FAILED
             and records[path].attempts < 1 + self.max_retries
         ]
         if retry_paths and self.max_retries:
             self._run_provider_upload(retry_paths, records, is_retry=True)
 
-        # Provider omissions are ambiguous, never successes.
-        for path in normalized:
+        # Omitted/pending provider records are ambiguous, never successes.
+        for path in valid_paths:
             if records[path].status in {AttachmentStatus.PENDING, AttachmentStatus.UPLOADING}:
                 records[path].status = AttachmentStatus.UNKNOWN
-                records[path].message = "provider did not return a final per-file status"
+                records[path].message = "Provider did not return a final per-file status."
 
         return UploadReport(self.provider.name, list(records.values()))
 
@@ -89,20 +128,23 @@ class AttachmentManager:
             for path in paths:
                 records[path].attempts += 1
                 records[path].status = AttachmentStatus.UNKNOWN
-                records[path].message = f"provider upload raised an exception; status is uncertain ({type(error).__name__})"
+                records[path].message = (
+                    "Provider upload raised an exception; status is uncertain "
+                    f"({type(error).__name__})."
+                )
             return
 
-        result_map = {Path(item.path).resolve(): item for item in results}
+        result_map = {Path(item.path).expanduser().resolve(): item for item in results}
         for path in paths:
             current = records[path]
             current.attempts += 1
             result = result_map.get(path)
             if result is None:
                 current.status = AttachmentStatus.UNKNOWN
-                current.message = "provider did not report this file; upload status is uncertain"
+                current.message = "Provider did not report this file; upload status is uncertain."
                 continue
             current.status = result.status
             current.message = result.message
             current.verification_method = result.verification_method
             if is_retry and current.status == AttachmentStatus.FAILED:
-                current.message = f"retry failed: {current.message}".strip()
+                current.message = f"Retry failed: {current.message}".strip()
