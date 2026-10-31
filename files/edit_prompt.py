@@ -1,8 +1,10 @@
-"""Build provider-neutral, structured edit prompts for AI Gateway."""
+"""Build provider-neutral, structured edit prompts for RelayPilot."""
 
-EDIT_PROTOCOL = r"""You are in AI Gateway EDIT MODE. Propose changes only; do not claim to have changed files directly.
+EDIT_PROTOCOL = r"""You are in RelayPilot EDIT MODE. Propose changes only; do not claim to have changed files directly.
 
 Return exactly one <AI_EDIT> block containing one or more <EDIT> blocks. Close every opening tag with its matching closing tag. Do not put prose outside the block unless required information is missing.
+
+CRITICAL OUTPUT ENVELOPE FOR BROWSER CHAT: Wrap the ENTIRE <AI_EDIT> block inside one five-backtick `text` code fence (opening line: five backticks followed by text; closing line: five backticks alone). This protects all literal XML-like protocol tags and indentation when the browser renders Markdown. Keep the existing fenced source code inside each <CONTENT> section; do not flatten it. The outer five-backtick fence is presentation-only and is NOT part of the file content. Only output the fenced block, no explanation above or below.
 
 For ordinary text files, use these operations:
 - replace
@@ -17,6 +19,7 @@ For Jupyter notebook files (.ipynb), use ONLY these structural operations:
 Never use text operations to edit the raw JSON of a notebook.
 
 TEXT-FILE FORMAT EXAMPLE:
+`````text
 <AI_EDIT>
 <EDIT>
 operation: insert_end
@@ -34,8 +37,10 @@ Add the requested function.
 </REASON>
 </EDIT>
 </AI_EDIT>
+`````
 
 NOTEBOOK EXAMPLE — EDIT AN EXISTING CELL:
+`````text
 <AI_EDIT>
 <EDIT>
 operation: edit_cell
@@ -54,8 +59,10 @@ Apply the discount to the total.
 </REASON>
 </EDIT>
 </AI_EDIT>
+`````
 
 NOTEBOOK EXAMPLE — ADD A MARKDOWN CELL AFTER CELL 3:
+`````text
 <AI_EDIT>
 <EDIT>
 operation: insert_cell
@@ -76,8 +83,10 @@ Explain the operation immediately before its implementation.
 </REASON>
 </EDIT>
 </AI_EDIT>
+`````
 
 NOTEBOOK EXAMPLE — ADD AN EXPLANATION AND EXECUTABLE CODE AS SEPARATE CELLS:
+`````text
 <AI_EDIT>
 <EDIT>
 operation: insert_cell
@@ -121,6 +130,7 @@ Add executable Python in a code cell following the Markdown explanation.
 </REASON>
 </EDIT>
 </AI_EDIT>
+`````
 
 Notebook rules:
 - Cell indices are zero-based indices into the original notebook cell array supplied in context.
@@ -146,6 +156,13 @@ General rules for all operations:
 - REASON must briefly explain the proposed change.
 - Put all requested changes inside the same AI_EDIT block.
 
+ATTACHMENT RULE: When workspace files are attached, read the attached files
+before producing the structured edit. Use exact workspace-relative references
+from the FILES ATTACHED manifest as the file identifier in each EDIT. Do not
+invent MATCH content or notebook cell indices if the attachment is unreadable;
+ask for the missing source instead. RelayPilot validates proposals against
+current local content before any write.
+
 CURRENT PROJECT FILE CONTEXT:
 {file_context}
 
@@ -155,13 +172,20 @@ CURRENT USER EDIT REQUEST:
 
 # Later edits reuse the established contract without resending the complete
 # instructions; notebook operations remain explicitly described.
-EDIT_CONTINUATION = r"""Continue using the established AI Gateway edit contract. Return exactly one <AI_EDIT> block containing correctly closed <EDIT>, <MATCH>, <CONTENT>, and <REASON> tags. Use the allowed operation that matches the target: standard text operations for ordinary text files; edit_cell or insert_cell for .ipynb files only. Never edit notebook JSON as raw text.
+EDIT_CONTINUATION = r"""Continue using the established RelayPilot edit contract. Return exactly one <AI_EDIT> block containing correctly closed <EDIT>, <MATCH>, <CONTENT>, and <REASON> tags. Enclose the COMPLETE block inside one five-backtick `text` Markdown fence. Preserve the inner code fence in <CONTENT>, matching opening and closing fence length. The browser must display literal tags and source indentation, never flatten them into prose. Return no text outside the outer fence. Use the allowed operation that matches the target: standard text operations for ordinary text files; edit_cell or insert_cell for .ipynb files only. Never edit notebook JSON as raw text.
 
 Notebook contract: indices are zero-based against the original notebook. edit_cell requires cell_index and MATCH containing the target cell's complete current source. insert_cell requires cell_type=code|markdown, position=before|after|start|end, and cell_index only for before/after; its MATCH must be empty. CONTENT is source wrapped in one complete Markdown fence; use a four-backtick outer fence when Markdown source includes triple-backtick code fences. Preserve unrelated cells, metadata, outputs, and execution counts. New code cells start with empty outputs and execution_count=null.
 
 CRITICAL NOTEBOOK CELL-TYPE RULE: For a requested section containing both explanatory prose and executable code, return multiple insert_cell operations in one AI_EDIT block. Put headings/prose/lists/interpretation in Markdown cells and executable Python statements in code cells. Never substitute a Markdown cell containing fenced Python for a code cell when that Python is intended to run. A fenced code example belongs inside Markdown only when the user wants it displayed rather than executed. List same-position insertions in final notebook order; for multiple position=end insertions, the first <EDIT> is the first inserted cell, followed by subsequent <EDIT> blocks.
 
 For text operations, MATCH must uniquely identify current text; it is empty only for insert_start and insert_end. For edit_cell, an empty MATCH is valid only for an empty source cell. Match opening/closing fence lengths exactly; the gateway strips the outer fence. Preserve indentation and line breaks. Ask rather than guess when required context is missing.
+
+ATTACHMENT RULE: When workspace files are attached, read the attached files
+before producing the structured edit. Use exact workspace-relative references
+from the FILES ATTACHED manifest as the file identifier in each EDIT. Do not
+invent MATCH content or notebook cell indices if the attachment is unreadable;
+ask for the missing source instead. RelayPilot validates proposals against
+current local content before any write.
 
 CURRENT PROJECT FILE CONTEXT:
 {file_context}
@@ -182,6 +206,6 @@ def build_edit_prompt(user_prompt, file_context, *, include_instructions=True):
             f'{file["content"]}'
         )
 
-    files_text = "\n\n".join(formatted_files) if formatted_files else "(No project file was referenced.)"
+    files_text = "\n\n".join(formatted_files) if formatted_files else "(No inline file contents; consult the attached-file manifest in the user request, if present.)"
     template = EDIT_PROTOCOL if include_instructions else EDIT_CONTINUATION
     return template.format(file_context=files_text, user_prompt=user_prompt)
