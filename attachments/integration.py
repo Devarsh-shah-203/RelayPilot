@@ -14,15 +14,13 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from attachments.limits import UploadLimitKind, classify_upload_limit
-from attachments.manager import AttachmentManager
+from attachments.manager import AttachmentManager, request_upload_limit_reason
 from attachments.models import AttachmentRecord, AttachmentStatus, UploadReport
 from attachments.policy import (
     EXCLUDED_DIRECTORY_NAMES,
     FileKind,
     attachment_character_threshold,
     attachment_size_threshold_bytes,
-    bulk_max_bytes,
-    bulk_max_files,
     classify_file,
     estimate_tokens,
     exclusion_reason,
@@ -65,6 +63,15 @@ class ResolvedFileReference:
             object.__setattr__(self, "source_reference", self.raw_reference)
 
 
+@dataclass(frozen=True)
+class ExcludedReference:
+    """A file or whole directory excluded during bulk enumeration."""
+
+    reference: str
+    reason: str
+    is_directory: bool = False
+
+
 @dataclass
 class AttachmentPlan:
     """Delivery plan created before any browser file selection occurs."""
@@ -82,6 +89,8 @@ class AttachmentPlan:
     skipped_count: int = 0
     skipped_reasons: dict[str, int] = field(default_factory=dict)
     token_threshold: int = 12_000
+    excluded_references: list[ExcludedReference] = field(default_factory=list)
+    preflight_issues: list[str] = field(default_factory=list)
 
     @property
     def inline_fallback_candidates(self) -> list[Path]:
@@ -123,6 +132,9 @@ def _split_reference_payload(payload: str) -> tuple[int, str]:
 
 def _is_bulk_reference(relative_path: str) -> bool:
     normalized = relative_path.replace("\\", "/").strip().strip("/").casefold()
+    # Explicit ./ paths are literal, including files named all.
+    if normalized.startswith("./"):
+        return False
     return normalized == "all" or normalized.endswith("/all")
 
 
@@ -205,14 +217,14 @@ def _collect_bulk_files(
     workspace_id: int,
     relative_directory: str,
     skipped_reasons: dict[str, int],
+    excluded_references: list[ExcludedReference] | None = None,
 ) -> list[tuple[Path, FileKind, str]]:
-    """Collect a deterministic, bounded list of safe files under a workspace root."""
+    """Collect the full eligible inventory before request-wide preflight."""
     workspace_root = _workspace_root(workspace_manager, workspace_id)
     scope_path = relative_directory.strip().replace("\\", "/").strip("/")
     collection_root = (
         workspace_manager.resolve_path(f"{workspace_id}/{scope_path or '.'}")
-        .expanduser()
-        .resolve()
+        .expanduser().resolve()
     )
     try:
         collection_root.relative_to(workspace_root)
@@ -220,25 +232,40 @@ def _collect_bulk_files(
         raise ValueError("Bulk file reference resolves outside the configured workspace.") from error
     if not collection_root.exists() or not collection_root.is_dir():
         raise ValueError(f"Bulk file selection is not a directory: <{workspace_id}/{scope_path or 'all'}>.")
-
-    # A user may explicitly aim at a generated directory; keep the exclusion policy
-    # consistent with recursive traversal instead of turning that into a bypass.
     scope_parts = collection_root.relative_to(workspace_root).parts
     if any(part.casefold() in EXCLUDED_DIRECTORY_NAMES for part in scope_parts):
         raise ValueError("Bulk selection points inside a generated/private directory that is excluded by policy.")
 
+    def exclude(path: Path, reason: str, *, directory: bool = False) -> None:
+        if excluded_references is not None:
+            relative = path.relative_to(workspace_root).as_posix()
+            reference = f"{workspace_id}/{relative}" + ("/" if directory else "")
+            entry = ExcludedReference(reference, reason, directory)
+            if entry in excluded_references:
+                return
+            excluded_references.append(entry)
+        _record_skip(skipped_reasons, reason)
+
+    def traversal_error(error: OSError) -> None:
+        failed = Path(error.filename) if error.filename else collection_root
+        try:
+            exclude(failed, f"inaccessible directory ({type(error).__name__})", directory=True)
+        except ValueError:
+            exclude(collection_root, f"directory traversal failed ({type(error).__name__})", directory=True)
+
     collected: list[tuple[Path, FileKind, str]] = []
-    total_bytes = 0
-    for current, directory_names, filenames in os.walk(collection_root, topdown=True, followlinks=False):
+    for current, directory_names, filenames in os.walk(
+        collection_root, topdown=True, followlinks=False, onerror=traversal_error
+    ):
         current_path = Path(current)
         filtered_dirs: list[str] = []
         for name in sorted(directory_names, key=lambda item: (item.casefold(), item)):
             child = current_path / name
             if name.casefold() in EXCLUDED_DIRECTORY_NAMES:
-                _record_skip(skipped_reasons, "generated/private directory")
+                exclude(child, "generated/private directory (entire directory excluded)", directory=True)
                 continue
             if child.is_symlink():
-                _record_skip(skipped_reasons, "symbolic link")
+                exclude(child, "symbolic link (entire directory excluded)", directory=True)
                 continue
             filtered_dirs.append(name)
         directory_names[:] = filtered_dirs
@@ -247,44 +274,30 @@ def _collect_bulk_files(
             path = current_path / name
             try:
                 if path.is_symlink() or not path.is_file():
-                    _record_skip(skipped_reasons, "symbolic link/non-regular file")
+                    exclude(path, "symbolic link/non-regular file")
                     continue
                 resolved = path.resolve()
                 resolved.relative_to(workspace_root)
             except (OSError, ValueError):
-                _record_skip(skipped_reasons, "path outside workspace or inaccessible")
+                exclude(path, "path outside workspace or inaccessible")
                 continue
-
             reason = exclusion_reason(resolved, root=workspace_root)
             if reason:
-                _record_skip(skipped_reasons, "safety/unsupported file")
+                exclude(path, reason)
                 continue
             kind = _source_code_or_text_kind(resolved)
             if kind == FileKind.NOTEBOOK:
-                _record_skip(skipped_reasons, "Jupyter notebook (use an explicit notebook reference)")
+                exclude(path, "Jupyter notebook (use an explicit notebook reference)")
                 continue
             if kind not in {FileKind.TEXT, FileKind.DOCUMENT, FileKind.IMAGE, FileKind.SPREADSHEET, FileKind.ARCHIVE}:
-                _record_skip(skipped_reasons, "unsupported/binary file")
+                exclude(path, "unsupported/binary file")
                 continue
-
             try:
-                size = resolved.stat().st_size
+                resolved.stat()
             except OSError:
-                _record_skip(skipped_reasons, "inaccessible file")
+                exclude(path, "inaccessible file")
                 continue
-            total_bytes += size
             collected.append((resolved, kind, resolved.relative_to(workspace_root).as_posix()))
-            if len(collected) > bulk_max_files():
-                raise ValueError(
-                    f"Bulk selection exceeds RELAYPILOT_BULK_MAX_FILES={bulk_max_files()}. "
-                    "Narrow the reference to a smaller folder. No files were uploaded."
-                )
-            if total_bytes > bulk_max_bytes():
-                raise ValueError(
-                    f"Bulk selection exceeds RELAYPILOT_BULK_MAX_BYTES={bulk_max_bytes()}. "
-                    "Narrow the reference to a smaller folder. No files were uploaded."
-                )
-
     collected.sort(key=lambda item: (item[2].casefold(), item[2]))
     return collected
 
@@ -316,6 +329,7 @@ def plan_referenced_files(
     memory_characters: int = 0,
     edit_mode: bool = False,
     force_attachments: bool | None = None,
+    trusted_memory_paths: Sequence[Path] = (),
 ) -> AttachmentPlan:
     """Resolve and vet references; upload-first even in structured edit mode.
 
@@ -324,6 +338,7 @@ def plan_referenced_files(
     approved recovery option after upload verification fails.
     """
     parsed = FileReferenceDetector().detect(prompt)
+    trusted_memory = {Path(path).expanduser().resolve() for path in trusted_memory_paths}
     threshold = inline_token_threshold()
     if not parsed:
         return AttachmentPlan(token_threshold=threshold, reason="No workspace file references found.")
@@ -335,6 +350,7 @@ def plan_referenced_files(
     seen_paths: set[Path] = set()
     source_refs: dict[str, SourceReference] = {}
     skipped_reasons: dict[str, int] = {}
+    excluded_references: list[ExcludedReference] = []
     has_bulk = False
 
     for detected in parsed:
@@ -346,16 +362,14 @@ def plan_referenced_files(
         source_refs[key] = source
 
         if is_bulk:
-            if edit_mode:
-                raise ValueError(
-                    "Bulk references are disabled in EDIT MODE. Select files explicitly so each proposed edit can be reviewed safely."
-                )
             has_bulk = True
             scope = re.sub(r"(?:^|/)all/?$", "", relative, flags=re.IGNORECASE).strip("/")
-            expanded = _collect_bulk_files(workspace_manager, workspace_id, scope, skipped_reasons)
-            if not expanded:
+            expanded = _collect_bulk_files(
+                workspace_manager, workspace_id, scope, skipped_reasons, excluded_references
+            )
+            if edit_mode and expanded:
                 raise ValueError(
-                    f"No eligible files were found for <{key}>. Unsupported, sensitive, generated, and notebook files are excluded from bulk selection."
+                    "Bulk references are disabled in EDIT MODE. Select files explicitly so each proposed edit can be reviewed safely."
                 )
             for path, kind, root_relative in expanded:
                 concrete = _normalize_reference(workspace_id, root_relative)
@@ -376,6 +390,15 @@ def plan_referenced_files(
         kind = classify_file(path)
         workspace_root = _workspace_root(workspace_manager, workspace_id)
         reason = exclusion_reason(path, root=workspace_root)
+        # Only documents already validated by the active project's memory
+        # registry may bypass the .ai/local-state directory exclusion. Sensitive
+        # filenames and other safety exclusions remain authoritative.
+        if (
+            path in trusted_memory and kind == FileKind.TEXT
+            and path.suffix.casefold() == ".md"
+            and reason == "file is inside a generated, private, or local-state directory"
+        ):
+            reason = None
         if reason and not (kind == FileKind.NOTEBOOK and reason == "notebook files use the existing cell-aware context workflow"):
             raise ValueError(f"Cannot use <{key}>: {reason}.")
         if kind == FileKind.UNKNOWN:
@@ -391,9 +414,6 @@ def plan_referenced_files(
             path_kinds[path] = kind
             path_chars[path] = char_count
 
-    if not all_paths:
-        raise ValueError("File references did not resolve to any usable files.")
-
     # Option B: every eligible explicitly referenced file is offered to the
     # browser uploader, in normal AND edit mode, regardless of size. A notebook
     # is also an explicit upload candidate; bulk notebook inclusion remains
@@ -402,14 +422,31 @@ def plan_referenced_files(
     # Inline delivery is strictly opt-in recovery after upload failure. We still
     # account for the request's own prompt, memory and filename manifest here.
     metadata_overhead = _request_metadata_overhead(all_paths, references)
+    metadata_overhead += sum(len(item.reference) + len(item.reason) + 40 for item in excluded_references)
+    local_limit = request_upload_limit_reason(all_paths)
     if estimate_tokens(len(prompt) + max(0, int(memory_characters)) + metadata_overhead)[1] > threshold:
+        labels = {}
+        for reference in references:
+            labels.setdefault(reference.path, reference.raw_reference)
+        inventory = [
+            f"- {labels.get(path, path.name)}: not delivered (complete request manifest exceeds inline budget)"
+            for path in all_paths
+        ]
+        excluded_inventory = [
+            f"- {item.reference}: excluded ({item.reason})" for item in excluded_references
+        ]
+        details = "\n".join(
+            ["SELECTED FILES - NONE DELIVERED"] + (inventory or ["- none"])
+            + (["EXCLUDED SELECTIONS"] + excluded_inventory if excluded_inventory else [])
+        )
         raise ValueError(
             "The prompt, enabled memory and referenced-file manifest exceed the configured "
-            "request budget. Narrow the request before uploading. No file was selected."
+            "request budget. Narrow the request before uploading. No file was selected.\n"
+            + details
         )
 
     return AttachmentPlan(
-        uses_attachments=True,
+        uses_attachments=bool(all_paths),
         references=references,
         paths=all_paths,
         reason="Explicit workspace references use upload-first delivery in all modes.",
@@ -421,6 +458,8 @@ def plan_referenced_files(
         skipped_count=sum(skipped_reasons.values()),
         skipped_reasons=skipped_reasons,
         token_threshold=threshold,
+        excluded_references=excluded_references,
+        preflight_issues=[local_limit] if local_limit else [],
     )
 
 
@@ -458,6 +497,7 @@ def _choose_inline_fallback(
     output_fn: Callable[[str], None],
     inline_payloads: dict[Path, str] | None = None,
     quota_text_paths: set[Path] | None = None,
+    automatic_all_if_fit: bool = False,
 ) -> list[Path] | None:
     """Select complete, budgeted source or prepared notebook text (never truncated)."""
     max_total_chars = max(0, token_threshold * 3 - max(0, inline_base_characters))
@@ -496,6 +536,17 @@ def _choose_inline_fallback(
     for index, path in enumerate(ordered, start=1):
         output_fn(f"  [{index}] {path.name} ({len(candidate_texts[path]):,} characters)")
     output_fn("Fallback is available only for complete, approved text/source content or selected notebook cell context. No content is truncated.")
+
+    # A confirmed upload quota can use the exact complete source contents
+    # automatically after the user has chosen inline delivery and acknowledged
+    # cleanup. Do not ask for a second file-number selection if *all* unresolved
+    # files fit the conservative budget. Never silently omit oversized files.
+    if automatic_all_if_fit and len(candidate_texts) == len(set(Path(p).resolve() for p in candidates)):
+        total_chars = inline_base_characters + sum(len(text) for text in candidate_texts.values())
+        total_chars += _INLINE_PER_FILE_OVERHEAD_CHARS * len(candidate_texts)
+        if estimate_tokens(total_chars)[1] <= token_threshold:
+            output_fn("All unresolved files fit the inline budget; including their complete contents automatically.")
+            return ordered
 
     while True:
         try:
@@ -544,6 +595,22 @@ def _settle_upload_failure(
     paths = [Path(r.path).resolve() for r in unresolved]
     uncertain = [r for r in unresolved if r.status == AttachmentStatus.UNKNOWN]
     has_limit = any(r.status == AttachmentStatus.LIMIT_EXCEEDED for r in unresolved)
+    quota_confirmed = any(
+        r.status == AttachmentStatus.LIMIT_EXCEEDED
+        and classify_upload_limit(r.message) == UploadLimitKind.PROVIDER_QUOTA
+        for r in unresolved
+    )
+    # Use the active attachment adapter's name rather than hardcoding ChatGPT.
+    # This is display-only; it does not imply an unvalidated provider is supported.
+    reported_provider = (report.provider_name or "").strip()
+    provider_label = {
+        "chatgpt": "ChatGPT",
+        "claude": "Claude",
+        "gemini": "Gemini",
+    }.get(reported_provider.casefold(), reported_provider or "The current provider")
+    # A provider quota can reject uploads while leaving failed attachment cards
+    # visible in the current composer. Inline/Skip must not silently submit them.
+    cleanup_required = bool(uncertain or quota_confirmed)
     quota_text_paths = {
         Path(record.path).resolve() for record in unresolved
         if record.status == AttachmentStatus.LIMIT_EXCEEDED
@@ -562,11 +629,24 @@ def _settle_upload_failure(
 
     output_fn("Attachment upload needs your decision (the prompt has NOT been sent):")
     for record in unresolved:
-        output_fn(f"  - {record.path.name}: {record.status.value} — {record.message}")
+        is_quota = (
+            record.status == AttachmentStatus.LIMIT_EXCEEDED
+            and classify_upload_limit(record.message) == UploadLimitKind.PROVIDER_QUOTA
+        )
+        # Large batches should show the shared account limit only once below,
+        # instead of repeating the same banner for every selected file.
+        reason = f"{provider_label} upload quota reached" if is_quota else record.message
+        output_fn(f"  - {record.path}: {record.status.value} — {reason}")
     if has_limit:
         messages = [record.message for record in unresolved if record.status == AttachmentStatus.LIMIT_EXCEEDED]
-        if any(classify_upload_limit(message) == UploadLimitKind.PROVIDER_QUOTA for message in messages):
-            output_fn("UPLOAD QUOTA REACHED: ChatGPT reports exhausted uploads. Choose an eligible inline fallback; do not retry until the quota resets.")
+        if quota_confirmed:
+            quota_evidence = next(
+                (message for message in messages
+                 if classify_upload_limit(message) == UploadLimitKind.PROVIDER_QUOTA), ""
+            )
+            output_fn(f"UPLOAD QUOTA REACHED: {provider_label} reports that file attachments are temporarily unavailable; do not retry until the quota resets.")
+            if quota_evidence:
+                output_fn(f"{provider_label} warning: " + quota_evidence[:500])
         else:
             output_fn("UPLOAD LIMIT DETECTED: a file-size or batch limit was reported. This is not necessarily an account upload quota.")
     if uncertain:
@@ -574,6 +654,11 @@ def _settle_upload_failure(
             "UNKNOWN means a file may already be present in the composer. "
             "Check Chrome and remove any unresolved attachment cards before retrying. "
             "RelayPilot will not silently skip such a file and send it anyway."
+        )
+    elif quota_confirmed:
+        output_fn(
+            f"UPLOAD QUOTA CLEANUP: {provider_label} may leave rejected or pending attachment cards in the composer. "
+            "Check Chrome and remove unresolved cards before sending inline or skipping files."
         )
 
     retry_paths = [r for r in unresolved if r.status in {AttachmentStatus.FAILED, AttachmentStatus.UNKNOWN}]
@@ -605,7 +690,7 @@ def _settle_upload_failure(
         "cancel",
     )
 
-    if selected in {"retry", "inline", "skip"} and uncertain and not cleanup_checked:
+    if selected in {"retry", "inline", "skip"} and cleanup_required and not cleanup_checked:
         # A UI checkbox is enough. In plain CLI mode, the separate text
         # confirmation remains available as a conservative fallback.
         confirmation = input_fn(
@@ -651,6 +736,7 @@ def _settle_upload_failure(
             input_fn=input_fn, output_fn=output_fn,
             inline_payloads=inline_payloads,
             quota_text_paths=quota_text_paths,
+            automatic_all_if_fit=quota_confirmed,
         )
         if selected_inline:
             chosen = {Path(p).resolve() for p in selected_inline}
@@ -748,6 +834,8 @@ def _rewrite_prompt_references(
         source = plan.source_references.get(key)
         refs = refs_by_source.get(key, [])
         if source and source.is_bulk:
+            if not refs:
+                return f"the empty eligible-file selection from workspace reference {source.display_reference}"
             return f"the eligible files selected from workspace reference {source.display_reference}"
         if not refs:
             return f"[file reference {key} was not resolved and is unavailable]"
@@ -778,10 +866,23 @@ def build_delivery_prompt(
     attached = list(dict.fromkeys(Path(path).expanduser().resolve() for path in attached_paths))
     inline = list(dict.fromkeys(Path(path).expanduser().resolve() for path in inline_paths))
     omitted = list(dict.fromkeys(Path(path).expanduser().resolve() for path in omitted_paths))
+    records_by_path = _report_record_map(report)
+    if report is not None:
+        unverified = [
+            path for path in attached
+            if path not in records_by_path
+            or records_by_path[path].status != AttachmentStatus.ATTACHED
+        ]
+        attached = [path for path in attached if path not in unverified]
+        omitted = list(dict.fromkeys(omitted + unverified))
+    delivered = set(attached) | set(inline)
+    omitted = list(dict.fromkeys(
+        [path for path in omitted if path not in delivered]
+        + [Path(path).resolve() for path in plan.paths if Path(path).resolve() not in delivered]
+    ))
     rewritten = _rewrite_prompt_references(original_prompt, plan, attached, inline, omitted, report)
 
     sections: list[str] = []
-    records_by_path = _report_record_map(report)
     reference_by_path: dict[Path, str] = {}
     for reference in plan.references:
         reference_by_path.setdefault(reference.path.resolve(), reference.raw_reference)
@@ -795,8 +896,10 @@ def build_delivery_prompt(
                 # Kept for compatibility with older reports; current recovery flow
                 # does not silently convert uncertain files into successes.
                 evidence = "manually confirmed by the user"
-            else:
+            elif record is not None and record.status == AttachmentStatus.ATTACHED:
                 evidence = "verified in the provider UI"
+            else:
+                evidence = "listed by caller; provider verification evidence unavailable"
             display_ref = reference_by_path.get(path, path.name)
             displayed = (display_filenames or {}).get(path, path.name)
             attached_lines.append(f"- `{display_ref}` ({evidence}; filename: `{displayed}`)")
@@ -822,8 +925,20 @@ def build_delivery_prompt(
             "===================\n"
             "These selected files are unavailable to this request. Do not infer or claim to have read them:\n"
             + "\n".join(
-                f"- `{reference_by_path.get(path, path.name)}` (filename: `{path.name}`)"
+                f"- `{reference_by_path.get(path, path.name)}` (filename: `{path.name}`; "
+                + (
+                    f"{records_by_path[path].status.value}: {records_by_path[path].message or 'no verified delivery'}"
+                    if path in records_by_path else "no verified delivery; omitted from this request"
+                ) + ")"
                 for path in omitted
+            )
+        )
+    if plan.excluded_references:
+        sections.append(
+            "FILES EXCLUDED BY SELECTION POLICY\n"
+            "==================================\n"
+            + "\n".join(
+                f"- `{item.reference}`: {item.reason}" for item in plan.excluded_references
             )
         )
     if plan.is_bulk_reference:
