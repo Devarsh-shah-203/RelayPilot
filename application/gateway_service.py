@@ -355,79 +355,83 @@ class GatewayService:
                 severity="warning",
             )
 
-        attached_paths = []
+        # Upload-first for normal requests and EDIT MODE alike. The existing
+        # parser, validator, diff and approval workflow remain authoritative.
+        attached_paths: list[Path] = []
         inline_paths = list(attachment_plan.inline_paths)
         upload_report = None
-
         if self.edit_mode:
-            # Mark the response as a protocol payload independently of any
-            # lagging /edit toggle in the Textual event loop. UI must never
-            # render the raw AI_EDIT block as a normal assistant response.
             from application.contracts import EditProposalStarted
             self.emit_event(EditProposalStarted(request_id=request_id))
-            file_context = build_inline_context(
-                self.file_context_builder, attachment_plan, inline_paths
+
+        if attachment_plan.uses_attachments:
+            if cancel_event.is_set():
+                return ServiceResult(state="CANCELLED")
+            on_state("PREPARING", "Uploading and verifying referenced files")
+            recovery_lines: list[str] = []
+
+            def show_recovery_line(line: str) -> None:
+                recovery_lines.append(line)
+
+            def request_recovery_choice(question: str) -> str:
+                # Existing recovery emitted a list via print/toasts and opened a
+                # modal containing only "Choice:". Include the entire choice list
+                # in the modal so users can actually make an informed decision.
+                explanation = "\n".join(recovery_lines[-45:])
+                recovery_lines.clear()
+                return self.request_user_input(
+                    f"{explanation}\n\n{question}" if explanation else question
+                )
+
+            upload_decision = upload_and_confirm(
+                attachment_plan.attachment_paths,
+                self.chat.page,
+                fallback_candidates=attachment_plan.inline_fallback_candidates,
+                inline_base_characters=inline_fallback_base_characters(
+                    prompt, attachment_plan, memory_characters
+                ),
+                token_threshold=attachment_plan.token_threshold,
+                input_fn=request_recovery_choice,
+                output_fn=show_recovery_line,
             )
+            upload_report = upload_decision.report
+            if upload_report is not None:
+                from application.contracts import AttachmentStatusChanged
+                for record in upload_report.records:
+                    self.emit_event(AttachmentStatusChanged(
+                        attachment_id=str(Path(record.path).resolve()),
+                        file_name=Path(record.path).name,
+                        status=record.status.value,
+                        message=record.message,
+                        request_id=request_id,
+                    ))
+            if not upload_decision.proceed:
+                self._notice(
+                    "The prompt was not sent because attachment recovery was cancelled "
+                    "or an uncertain upload could not safely be excluded. Inspect the "
+                    "browser attachment area before retrying.",
+                    title="Attachment request cancelled", severity="warning",
+                )
+                return ServiceResult(state="CANCELLED", submitted=False)
+            attached_paths = list(upload_decision.attached_paths)
+            inline_paths.extend(upload_decision.inline_paths)
+
+        delivered = {path.resolve() for path in attached_paths} | {path.resolve() for path in inline_paths}
+        omitted_paths = [path for path in attachment_plan.paths if path.resolve() not in delivered]
+        file_context = build_inline_context(self.file_context_builder, attachment_plan, inline_paths)
+        delivery_prompt = build_delivery_prompt(
+            prompt, attachment_plan,
+            attached_paths=attached_paths, inline_paths=inline_paths,
+            omitted_paths=omitted_paths, report=upload_report,
+        )
+        if self.edit_mode:
             final_prompt = build_edit_prompt(
-                prompt,
-                file_context,
+                delivery_prompt, file_context,
                 include_instructions=not self.edit_protocol_sent,
             )
         else:
-            if attachment_plan.uses_attachments:
-                if cancel_event.is_set():
-                    return ServiceResult(state="CANCELLED")
-                on_state("PREPARING", "Uploading and verifying referenced files")
-                fallback_base = inline_fallback_base_characters(
-                    prompt, attachment_plan, memory_characters
-                )
-                upload_decision = upload_and_confirm(
-                    attachment_plan.attachment_paths,
-                    self.chat.page,
-                    fallback_candidates=attachment_plan.inline_fallback_candidates,
-                    inline_base_characters=fallback_base,
-                    token_threshold=attachment_plan.token_threshold,
-                    input_fn=self.request_user_input,
-                    output_fn=lambda message: self._notice(message, title="Attachment recovery", severity="warning"),
-                )
-                upload_report = upload_decision.report
-                if upload_report is not None:
-                    from application.contracts import AttachmentStatusChanged
-
-                    for record in upload_report.records:
-                        self.emit_event(
-                            AttachmentStatusChanged(
-                                attachment_id=str(Path(record.path).resolve()),
-                                file_name=Path(record.path).name,
-                                status=record.status.value,
-                                message=record.message,
-                                request_id=request_id,
-                            )
-                        )
-                if not upload_decision.proceed:
-                    self._notice(
-                        "Prompt was not submitted because the required file delivery was not completed. Check any staged attachment cards in Chrome before retrying.",
-                        title="Attachment delivery cancelled",
-                        severity="warning",
-                    )
-                    return ServiceResult(state="CANCELLED", submitted=False)
-                attached_paths = list(upload_decision.attached_paths)
-                inline_paths.extend(upload_decision.inline_paths)
-
-            delivered = {path.resolve() for path in attached_paths} | {path.resolve() for path in inline_paths}
-            omitted_paths = [path for path in attachment_plan.paths if path.resolve() not in delivered]
-            file_context = build_inline_context(self.file_context_builder, attachment_plan, inline_paths)
-            model_prompt = build_delivery_prompt(
-                prompt,
-                attachment_plan,
-                attached_paths=attached_paths,
-                inline_paths=inline_paths,
-                omitted_paths=omitted_paths,
-                report=upload_report,
-            )
             final_prompt = self.context_builder.build(
-                model_prompt,
-                include_memory=include_memory,
+                delivery_prompt, include_memory=include_memory,
                 file_context=file_context,
             )
 
@@ -464,9 +468,24 @@ class GatewayService:
                 from application.contracts import EditReviewResult
 
                 try:
-                    # The existing parser, validator, diff generator and write
-                    # approval workflow remain authoritative. Never apply raw
-                    # AI_EDIT text without validating its structure.
+                    # Validate proposal targets against files explicitly delivered
+                    # for this request. An edit targeting an omitted/failed file
+                    # cannot be approved even if a model invents an insert_end
+                    # operation that requires no MATCH. This is checked BEFORE
+                    # the existing diff/approval writer is invoked.
+                    proposed_edits = self.edit_workflow.parser.parse(result)
+                    if not proposed_edits:
+                        raise ValueError("The model did not provide a valid edit proposal.")
+                    delivered_files = {path.resolve() for path in attached_paths + inline_paths}
+                    for edit in proposed_edits:
+                        target = self.workspace.resolve_path(edit.file).resolve()
+                        if target not in delivered_files:
+                            raise ValueError(
+                                f"Edit target {edit.file} was not delivered by this request; "
+                                "refusing to apply a change to a skipped file."
+                            )
+                    # Existing parser/validator/diff/approval writer remains the
+                    # authoritative path for accepted proposals.
                     edit_results = self.edit_workflow.run(result)
                     if cancel_event.is_set():
                         return ServiceResult(state="CANCELLED", response=result, submitted=True)
