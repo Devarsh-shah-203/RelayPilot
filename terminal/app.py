@@ -358,7 +358,11 @@ class RelayPilotApp(App[None]):
             self._set_request_progress(event.request_id, "● Waiting for your input…")
             self.push_screen(
                 UserInputScreen(event.prompt),
-                lambda value: self.runtime.resolve_user_input(event.input_id, value or "0"),
+                # An empty notebook selection means its documented default.
+                # Only None (dismissed without a result) maps to cancellation.
+                lambda value: self.runtime.resolve_user_input(
+                    event.input_id, "0" if value is None else value
+                ),
             )
             return
 
