@@ -43,10 +43,12 @@ _ERROR_TERMS = (
     "exceeds the maximum file size", "exceeds max file size", "file size exceeds",
     "file is too big", "upload quota", "no more uploads",
     "you've reached your file upload limit", "you have reached your file upload limit",
+    "you've reached the limit for file attachments", "you’ve reached the limit for file attachments",
     "you've reached your upload limit", "you have reached your upload limit",
     "file uploads are currently unavailable", "uploads are temporarily unavailable",
     "maximum number of files", "maximum files per message", "maximum number of attachments",
     "select fewer files", "only upload up to", "limit on the number of files",
+    "get plus for more uploads", "to upload again", "you can upload more files after",
 )
 @dataclass(frozen=True)
 class FileInputInfo:
@@ -242,12 +244,33 @@ class BrowserAttachmentProvider:
         if not eligible:
             return list(results.values())
 
+        # Protect direct adapter callers as well as AttachmentManager callers.
+        # A quota banner may already be visible before the upload menu opens.
+        quota_warning = self.preflight_upload_limit(eligible)
+        if quota_warning:
+            for path in eligible:
+                results[path].status = AttachmentStatus.LIMIT_EXCEEDED
+                results[path].message = quota_warning
+                results[path].verification_method = "visible_provider_quota"
+            return list(results.values())
+
         try:
             self.prepare_for_upload(eligible)
         except Exception as exc:
             for path in eligible:
                 results[path].status = AttachmentStatus.FAILED
                 results[path].message = f"Could not open the provider's attachment interface ({type(exc).__name__})."
+            return list(results.values())
+
+        # The provider may only expose its quota notice *after opening* the
+        # attachment menu (e.g. "Get Plus for more uploads"). Recheck before
+        # calling a disabled/missing input "UNKNOWN" or attempting a selection.
+        quota_warning = self.preflight_upload_limit(eligible)
+        if quota_warning:
+            for path in eligible:
+                results[path].status = AttachmentStatus.LIMIT_EXCEEDED
+                results[path].message = quota_warning
+                results[path].verification_method = "visible_provider_quota"
             return list(results.values())
 
         inputs = self._get_file_inputs()
@@ -287,7 +310,25 @@ class BrowserAttachmentProvider:
                 continue
             batches = [group] if candidate.multiple or len(group) == 1 else [[path] for path in group]
             for batch in batches:
+                # Re-check after each batch: ChatGPT may reveal its quota only
+                # after the first set_input_files call. Stop staging more files.
+                quota_warning = self.preflight_upload_limit(batch)
+                if quota_warning:
+                    for path in eligible:
+                        if results[path].status != AttachmentStatus.ATTACHED:
+                            results[path].status = AttachmentStatus.LIMIT_EXCEEDED
+                            results[path].message = quota_warning
+                            results[path].verification_method = "visible_provider_quota"
+                    return list(results.values())
                 self._upload_batch(batch, results)
+                quota_warning = self.preflight_upload_limit(batch)
+                if quota_warning:
+                    for path in eligible:
+                        if results[path].status != AttachmentStatus.ATTACHED:
+                            results[path].status = AttachmentStatus.LIMIT_EXCEEDED
+                            results[path].message = quota_warning
+                            results[path].verification_method = "visible_provider_quota"
+                    return list(results.values())
 
         return list(results.values())
 
@@ -475,6 +516,122 @@ class BrowserAttachmentProvider:
             results[path].message = message
             results[path].verification_method = method
 
+    def _quota_notice_in_open_upload_menu(self) -> tuple[str, ...]:
+        """Find explicit upload-quota text within a *visible, open* attachment menu.
+
+        The menu may extend far above the composer, so a composer-proximity-only
+        search misses quota notices near its top. Restrict this to active menu/
+        popover/dialog elements to avoid treating conversation history as proof.
+        """
+        try:
+            values = self.page.evaluate(r"""() => {
+                const selectors = [
+                    '[role="menu"]', '[role="dialog"]',
+                    '[data-radix-menu-content]', '[data-radix-popper-content-wrapper]',
+                    '[data-testid*="upload-menu" i]', '[data-testid*="attachment-menu" i]',
+                    '[data-testid*="popover" i]',
+                ];
+                const explicitQuota = /get\s+plus\s+for\s+more\s+uploads|(?:or\s+)?wait\s+(?:\d+\s+(?:hours?|minutes?|days?)\s*)+to\s+upload\s+again|(?:you['’]ve|you have) reached (?:the|your) (?:limit|quota) (?:for|of) (?:file )?attachments?/i;
+                const output = [];
+                const seen = new Set();
+                for (const el of selectors.flatMap(selector =>
+                    Array.from(document.querySelectorAll(selector)))) {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    if (rect.width <= 0 || rect.height <= 0 ||
+                        rect.right <= 0 || rect.left >= innerWidth ||
+                        rect.bottom <= 0 || rect.top >= innerHeight ||
+                        style.visibility === 'hidden' || style.display === 'none' ||
+                        el.getAttribute('aria-hidden') === 'true' ||
+                        el.getAttribute('data-state') === 'closed' ||
+                        el.closest('[data-message-author-role], [data-testid*="conversation-turn" i], article, aside, nav')) continue;
+                    const text = (el.innerText || '').trim();
+                    if (!text || text.length > 3500 || !explicitQuota.test(text)) continue;
+                    // Return only the relevant quota lines and the reset time,
+                    // not the entire menu containing unrelated tools.
+                    const lines = text.split(/\n+/).map(line => line.trim()).filter(Boolean);
+                    const relevant = lines.filter(line =>
+                        explicitQuota.test(line) || /try again.*(?:upload|tomorrow|\d)/i.test(line));
+                    const detail = (relevant.length ? relevant : [text]).join('\n').slice(0, 500);
+                    if (detail && !seen.has(detail)) {
+                        seen.add(detail);
+                        output.push(detail);
+                    }
+                    if (output.length >= 3) break;
+                }
+                return output;
+            }""")
+            return tuple(str(item).strip() for item in (values or []) if str(item).strip())
+        except Exception:
+            return ()
+
+    def _quota_banner_near_composer(self) -> tuple[str, ...]:
+        """Read explicit, visible upload-quota banners near the active composer.
+
+        ChatGPT's "You've reached the limit for file attachments" banner is
+        not consistently exposed as a role=alert/toast. Scan only visible text
+        around the composer, not historical chat messages or the sidebar.
+        """
+        try:
+            values = self.page.evaluate(r"""() => {
+                const selectors = [
+                    '#prompt-textarea', '[data-testid="prompt-textarea"]',
+                    '[contenteditable="true"]', 'textarea'
+                ];
+                const anchors = selectors.flatMap(selector =>
+                    Array.from(document.querySelectorAll(selector))
+                ).filter(el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                });
+                if (!anchors.length) return [];
+                const anchor = anchors.sort((a,b) =>
+                    b.getBoundingClientRect().top - a.getBoundingClientRect().top
+                )[0];
+                const composer = anchor.getBoundingClientRect();
+                const re = /(?:you['’]ve|you have) reached (?:the|your) (?:limit|quota) (?:for|of) (?:file )?attachments?|reached the limit for file attachments|(?:you['’]ve|you have) reached (?:your|the) (?:file )?upload limit|get\s+plus\s+for\s+more\s+uploads|(?:or\s+)?wait\s+(?:\d+\s+(?:hours?|minutes?|days?)\s*)+to\s+upload\s+again/i;
+                const excluded = '[data-message-author-role], [data-testid*="conversation-turn" i], [role="log"], article, aside, nav';
+                const iterator = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                const output = [];
+                const seen = new Set();
+                let node, scanned = 0;
+                while ((node = iterator.nextNode()) && scanned++ < 30000) {
+                    const el = node.parentElement;
+                    if (!el || !node.textContent.trim() || el.closest(excluded) || anchor.contains(el)) continue;
+                    let candidate = el;
+                    for (let depth = 0; depth < 3 && candidate; depth++, candidate = candidate.parentElement) {
+                        if (candidate === document.body || candidate === document.documentElement) continue;
+                        const content = (candidate.innerText || candidate.textContent || '').trim();
+                        if (!content || content.length > 450 || !re.test(content)) continue;
+                        const rect = candidate.getBoundingClientRect();
+                        const style = getComputedStyle(candidate);
+                        if (!rect.width || !rect.height || style.display === 'none' ||
+                            style.visibility === 'hidden' || rect.bottom < 0 ||
+                            rect.top > innerHeight || rect.bottom < composer.top - 800 ||
+                            rect.top > composer.bottom + 150 ||
+                            rect.right < composer.left - 80 || rect.left > composer.right + 80) continue;
+                        // Keep the reset/try-again date if the banner displays it.
+                        // Never walk into an entire form, chat article, or page body.
+                        let detail = content;
+                        const parent = candidate.parentElement;
+                        if (parent && parent !== document.body && !parent.matches(excluded)) {
+                            const more = (parent.innerText || '').trim();
+                            if (more.length <= 450 && re.test(more) &&
+                                /try again|upgrade to add more|to upload again/i.test(more)) detail = more;
+                        }
+                        if (!seen.has(detail)) { seen.add(detail); output.push(detail); }
+                        break;
+                    }
+                    if (output.length >= 3) break;
+                }
+                return output;
+            }""")
+            return tuple(str(item).strip() for item in (values or []) if str(item).strip())
+        except Exception:
+            return ()
+
     def _snapshot(self) -> PageSnapshot:
         body_text = ""
         composer_text = ""
@@ -530,6 +687,12 @@ class BrowserAttachmentProvider:
             alerts = tuple(values)
         except Exception:
             pass
+        # Visible account-quota banners may be plain divs (not ARIA alerts).
+        # Only this scoped evidence is added; never scan historical body text.
+        banner_warnings = self._quota_banner_near_composer()
+        menu_warnings = self._quota_notice_in_open_upload_menu()
+        if banner_warnings or menu_warnings:
+            alerts = tuple(dict.fromkeys((*alerts, *menu_warnings, *banner_warnings)))
         return PageSnapshot(
             body_text=body_text,
             attachment_count=attachment_count,
@@ -687,6 +850,15 @@ class BrowserAttachmentProvider:
         pending_error: tuple[AttachmentStatus, str] | None = None
         while time.monotonic() < deadline:
             after = self._snapshot()
+            # A confirmed account quota is decisive even when it was already
+            # visible before selection or upload chips remain staged in Chrome.
+            visible_quota = next((item for item in after.alerts
+                                  if classify_upload_limit(item) == UploadLimitKind.PROVIDER_QUOTA), None)
+            if visible_quota:
+                return {
+                    path: (AttachmentStatus.LIMIT_EXCEEDED, visible_quota[:500], "visible_provider_quota")
+                    for path in paths
+                }
             observed_error = self._error_from_snapshot(before, after)
             if observed_error:
                 pending_error = observed_error
