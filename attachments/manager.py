@@ -6,8 +6,40 @@ from pathlib import Path
 from typing import Sequence
 
 from .models import AttachmentRecord, AttachmentStatus, UploadReport
-from .policy import classify_file, exclusion_reason, FileKind
+from .policy import bulk_max_bytes, bulk_max_files, classify_file, exclusion_reason, FileKind
 from .provider import AttachmentProvider
+
+
+
+def request_upload_limit_reason(paths: Sequence[str | Path]) -> str:
+    """Check the complete local request budget without claiming provider quota."""
+    normalized = list(dict.fromkeys(Path(path).expanduser().resolve() for path in paths))
+    issues: list[str] = []
+    maximum_files, maximum_bytes = bulk_max_files(), bulk_max_bytes()
+    if len(normalized) > maximum_files:
+        issues.append(
+            f"request file count {len(normalized)} exceeds "
+            f"RELAYPILOT_BULK_MAX_FILES={maximum_files}"
+        )
+    try:
+        total_bytes = sum(path.stat().st_size for path in normalized)
+    except OSError as error:
+        return (
+            "Local request preflight could not inspect every selected file "
+            f"({type(error).__name__}). No selected files were staged."
+        )
+    if total_bytes > maximum_bytes:
+        issues.append(
+            f"request total size {total_bytes} bytes exceeds "
+            f"RELAYPILOT_BULK_MAX_BYTES={maximum_bytes}"
+        )
+    if not issues:
+        return ""
+    return (
+        "Local request preflight: " + "; ".join(issues)
+        + ". No selected files were staged. These are configured RelayPilot "
+        "request limits; provider account availability has not been determined."
+    )
 
 
 class AttachmentManager:
@@ -79,6 +111,17 @@ class AttachmentManager:
             valid_paths.append(path)
 
         if not valid_paths:
+            return UploadReport(self.provider.name, list(records.values()))
+
+        # Check the deduplicated, complete upload set before staging any file.
+        # UNSUPPORTED is local request policy, never evidence of account quota.
+        # Recovery can still offer complete text under the shared inline budget.
+        local_limit = request_upload_limit_reason(valid_paths)
+        if local_limit:
+            for path in valid_paths:
+                records[path].status = AttachmentStatus.UNSUPPORTED
+                records[path].message = local_limit
+                records[path].verification_method = "local_request_preflight"
             return UploadReport(self.provider.name, list(records.values()))
 
         # Providers can only preflight limits that are explicitly visible in the
