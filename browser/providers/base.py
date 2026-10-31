@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import mimetypes
 import re
+from collections import Counter
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,7 +82,7 @@ class BrowserAttachmentProvider:
     # attributes still decide which of these the selected provider input accepts.
     allowed_kinds = {
         FileKind.TEXT, FileKind.DOCUMENT, FileKind.IMAGE, FileKind.SPREADSHEET,
-        FileKind.ARCHIVE,
+        FileKind.ARCHIVE, FileKind.NOTEBOOK,
     }
 
     def __init__(self, page: Page, *, upload_timeout_floor: float = 30.0,
@@ -531,11 +532,14 @@ class BrowserAttachmentProvider:
         candidates = [item for item in after.alerts if item not in before.alerts]
         for candidate in candidates:
             text = candidate.casefold()
-            matched = next((term for term in _ERROR_TERMS if term in text), None)
-            if not matched:
-                continue
-
             limit_kind = classify_upload_limit(candidate)
+            matched = next((term for term in _ERROR_TERMS if term in text), None)
+            # Recognize all of the strict limit phrases, not only the subset
+            # duplicated in _ERROR_TERMS. The candidate is already scoped to
+            # an active alert/toast, not unrelated browser history text.
+            if not matched and limit_kind == UploadLimitKind.UNKNOWN:
+                continue
+            matched = matched or "provider upload limit"
             if limit_kind in {
                 UploadLimitKind.BATCH_COUNT,
                 UploadLimitKind.FILE_SIZE,
@@ -568,8 +572,11 @@ class BrowserAttachmentProvider:
         because it did not change text. Otherwise filename evidence alone could
         incorrectly mark a failed or blocked upload as attached.
         """
-        previous = {item for item in before.alerts if any(term in item.casefold() for term in _ERROR_TERMS)}
-        current = {item for item in after.alerts if any(term in item.casefold() for term in _ERROR_TERMS)}
+        def upload_warning(value: str) -> bool:
+            return any(term in value.casefold() for term in _ERROR_TERMS) or classify_upload_limit(value) != UploadLimitKind.UNKNOWN
+
+        previous = {item for item in before.alerts if upload_warning(item)}
+        current = {item for item in after.alerts if upload_warning(item)}
         return bool(previous & current)
 
     @staticmethod
@@ -621,28 +628,38 @@ class BrowserAttachmentProvider:
         return mapped
 
     @staticmethod
-    def _new_filename_evidence(path: Path, before: PageSnapshot, after: PageSnapshot) -> bool:
-        """Require exact new filename evidence from the composer or changed attachment nodes.
+    def _filename_pattern(path: Path) -> re.Pattern[str]:
+        """Match original names and ChatGPT's numbered duplicate-name variants.
 
-        A filename appearing in history, a conversation title, or as a substring of
-        another filename is insufficient evidence that the requested file was staged.
+        Examples: test.py, test(1).py, test (2).py, test.py(3). The
+        boundary prevents test.py.backup or other similarly named files from
+        being mistaken for this upload. These matches are evidence *only* when
+        they occur on newly added/staged attachment UI elements.
         """
-        name = path.name
-        pattern = re.compile(
-            rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])",
-            re.IGNORECASE,
-        )
-        composer_evidence = (
-            bool(pattern.search(after.composer_text))
-            and not bool(pattern.search(before.composer_text))
-        )
-        previous_metadata = set(before.attachment_metadata)
-        new_metadata = [
-            item for item in after.attachment_metadata
-            if item not in previous_metadata
-        ]
-        attachment_evidence = any(pattern.search(item) for item in new_metadata)
-        return composer_evidence or attachment_evidence
+        stem, suffix = re.escape(path.stem), re.escape(path.suffix)
+        if path.suffix:
+            filename = rf"{stem}(?: ?\([1-9]\d*\))?{suffix}(?: ?\([1-9]\d*\))?"
+        else:
+            filename = rf"{stem}(?: ?\([1-9]\d*\))?"
+        return re.compile(rf"(?<![A-Za-z0-9_.-]){filename}(?![A-Za-z0-9_.-])", re.IGNORECASE)
+
+    @staticmethod
+    def _new_filename_evidence(path: Path, before: PageSnapshot, after: PageSnapshot) -> bool:
+        """Require a new staged-file signal, not a filename in chat history.
+
+        Multisets (rather than sets) retain a second identical attachment card.
+        Browser-generated filename suffixes count as matching the local name,
+        but only when a new matching card/occurrence is observed.
+        """
+        pattern = BrowserAttachmentProvider._filename_pattern(path)
+        before_metadata = Counter(before.attachment_metadata)
+        after_metadata = Counter(after.attachment_metadata)
+        new_metadata = after_metadata - before_metadata
+        if any(pattern.search(text) for text in new_metadata.elements()):
+            return True
+        old_composer_hits = len(pattern.findall(before.composer_text))
+        new_composer_hits = len(pattern.findall(after.composer_text))
+        return new_composer_hits > old_composer_hits
 
     def _timeout_for(self, paths: Sequence[Path]) -> float:
         total_mib = sum(path.stat().st_size for path in paths if path.exists()) / (1024 * 1024)
