@@ -109,7 +109,8 @@ class InlineEditReview(Vertical):
         return f"{action}  ·  {self._change_summary(self.diff)}"
 
     def compose(self):
-        yield Static(f"PROPOSED EDIT: {self.file_name}", classes="edit-review-title", markup=False)
+        title = "NEW FILE REQUEST" if self.reason.startswith("New file request\n") else "PROPOSED EDIT"
+        yield Static(f"{title}: {self.file_name}", classes="edit-review-title", markup=False)
         yield Static("Reason:", classes="edit-section-title", markup=False)
         yield Static(self.reason or "No reason supplied.", classes="edit-reason", markup=False)
         yield Static("Changes:", classes="edit-section-title", markup=False)
@@ -172,6 +173,7 @@ class InlineEditReview(Vertical):
         label = {
             "APPLIED": "✓ APPLIED — file updated",
             "REJECTED": "✕ REJECTED — file unchanged",
+            "FAILED": "FAILED - inspect this file; see the error below",
         }.get(result, result)
         self.query_one(".edit-decision", Static).update(label)
 
